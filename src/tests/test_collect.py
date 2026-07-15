@@ -92,6 +92,16 @@ class TestCollect(TestCase):
         self.patcher_calculateHistoryTimeRange = patch('vuegraf.collect.calculateHistoryTimeRange')
         self.patcher_convertToLocalDayInUTC = patch('vuegraf.collect.convertToLocalDayInUTC',
                                                     side_effect=lambda cfg, dt: dt.replace(hour=0, minute=0, second=0, microsecond=0))
+        # Persistence and CSV-cache layer: isolate history tests from InfluxDB and the filesystem.
+        self.patcher_writeInfluxPoints = patch('vuegraf.collect.writeInfluxPoints')
+        self.patcher_isCacheEnabled = patch('vuegraf.collect.isCacheEnabled', return_value=True)
+        self.patcher_writeHistoryBatchCsv = patch('vuegraf.collect.writeHistoryBatchCsv')
+        self.patcher_loadManifest = patch('vuegraf.collect.loadManifest', return_value=None)
+        self.patcher_bootstrapManifest = patch('vuegraf.collect.bootstrapManifestFromCsvs', return_value=None)
+        self.patcher_saveManifest = patch('vuegraf.collect.saveManifest')
+        self.patcher_restoreCache = patch('vuegraf.collect.restoreCacheToInflux', return_value=0)
+        self.patcher_getCacheCsvPath = patch('vuegraf.collect.getCacheCsvPath', return_value='/tmp/test_history.csv')
+        self.patcher_loadMirroredKeys = patch('vuegraf.collect.loadMirroredKeys', return_value=frozenset())
 
         self.mock_getConfigValue = self.patcher_getConfigValue.start()
         self.mock_getInfluxTag = self.patcher_getInfluxTag.start()
@@ -100,6 +110,15 @@ class TestCollect(TestCase):
         self.mock_getLastDBTimeStamp = self.patcher_getLastDBTimeStamp.start()
         self.mock_calculateHistoryTimeRange = self.patcher_calculateHistoryTimeRange.start()
         self.mock_convertToLocalDayInUTC = self.patcher_convertToLocalDayInUTC.start()
+        self.mock_writeInfluxPoints = self.patcher_writeInfluxPoints.start()
+        self.mock_isCacheEnabled = self.patcher_isCacheEnabled.start()
+        self.mock_writeHistoryBatchCsv = self.patcher_writeHistoryBatchCsv.start()
+        self.mock_loadManifest = self.patcher_loadManifest.start()
+        self.mock_bootstrapManifest = self.patcher_bootstrapManifest.start()
+        self.mock_saveManifest = self.patcher_saveManifest.start()
+        self.mock_restoreCache = self.patcher_restoreCache.start()
+        self.mock_getCacheCsvPath = self.patcher_getCacheCsvPath.start()
+        self.mock_loadMirroredKeys = self.patcher_loadMirroredKeys.start()
 
     def tearDown(self):
         self.patcher_getConfigValue.stop()
@@ -109,6 +128,15 @@ class TestCollect(TestCase):
         self.patcher_getLastDBTimeStamp.stop()
         self.patcher_calculateHistoryTimeRange.stop()
         self.patcher_convertToLocalDayInUTC.stop()
+        self.patcher_writeInfluxPoints.stop()
+        self.patcher_isCacheEnabled.stop()
+        self.patcher_writeHistoryBatchCsv.stop()
+        self.patcher_loadManifest.stop()
+        self.patcher_bootstrapManifest.stop()
+        self.patcher_saveManifest.stop()
+        self.patcher_restoreCache.stop()
+        self.patcher_getCacheCsvPath.stop()
+        self.patcher_loadMirroredKeys.stop()
 
     def _mock_getConfigValue(self, config, key, default=None):
         # Simplified mock for getConfigValue

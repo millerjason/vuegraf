@@ -85,6 +85,13 @@ def initArgs():
         action='store_true',
         default=False
         )
+    parser.add_argument(
+        '--skiprestore',
+        help='During history backfill, skip restoring the cached CSV range into InfluxDB '
+             '(assume it is already present) and only fetch/true-up the uncovered range',
+        action='store_true',
+        default=False
+        )
     args = parser.parse_args()
     return args
 
@@ -110,6 +117,8 @@ def initConfig():
         config = json.load(configFile)
 
     setConfigDefault(config, 'addStationField', False)
+    setConfigDefault(config, 'csvCacheEnabled', False)
+    setConfigDefault(config, 'csvCacheDir', 'backfill')
     setConfigDefault(config, 'detailedIntervalSecs', 3600)
     setConfigDefault(config, 'detailedDataEnabled', False)
     setConfigDefault(config, 'detailedDataDaysEnabled', True)

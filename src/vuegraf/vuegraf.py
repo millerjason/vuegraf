@@ -25,6 +25,7 @@ import traceback
 from pyemvue.enums import Scale
 
 # Local imports
+from vuegraf.cache import writeRollupPoints
 from vuegraf.collect import collectHistoryUsage, collectUsage
 from vuegraf.config import getConfigValue, initConfig
 from vuegraf.device import initDeviceAccount
@@ -101,6 +102,10 @@ def run():
                     collectUsage(config, account, None, nowLagUTC, collectDetails, usageDataPoints,
                                  detailedStartTimeUTC, Scale.MINUTE.value)
 
+                    # Everything appended from here on is an hourly or daily rollup, and is
+                    # mirrored to the CSV cache below.
+                    rollupStartIdx = len(usageDataPoints)
+
                     # Collect hourly averages if the hour just changed. Use UTC time for this to avoid DST
                     # issues.
                     if detailedHoursEnabled and curHourUTC != prevHourUTC:
@@ -114,6 +119,10 @@ def run():
                         prevDayUTC = prevDayLocal.astimezone(datetime.UTC)
                         collectUsage(config, account, prevDayUTC, prevDayUTC, False, usageDataPoints, None, Scale.DAY.value)
                         prevDayLocal = curDayLocal
+
+                    # Keep the CSV copy as current as InfluxDB. These rollups are settled and
+                    # time-aligned across devices, unlike the minute points, which are not mirrored.
+                    writeRollupPoints(config, account, usageDataPoints[rollupStartIdx:])
 
             except Exception:
                 logger.error('Failed to record new usage data: {}'.format(sys.exc_info()))
