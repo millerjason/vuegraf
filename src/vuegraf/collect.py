@@ -11,9 +11,21 @@ from typing import Union
 
 from pyemvue.enums import Scale, Unit
 
+from vuegraf.cache import (
+    bootstrapManifestFromCsvs,
+    getCacheCsvPath,
+    isCacheEnabled,
+    loadManifest,
+    loadMirroredKeys,
+    pointKey,
+    restoreCacheToDatabase,
+    saveManifest,
+    subtractCoverage,
+    writeCsvPoints,
+)
 from vuegraf.config import getConfigValue
 from vuegraf.device import lookupDeviceName, lookupChannelName
-from vuegraf.destination import getLastDBTimeStamp, getTags
+from vuegraf.destination import getLastDBTimeStamp, getTags, writeDataPoints
 from vuegraf.time import calculateHistoryTimeRange, convertToLocalDayInUTC
 
 
@@ -255,29 +267,164 @@ def collectUsage(config, account, startTimeUTC, stopTimeUTC, collectDetails, usa
                               usageDataPoints, detailedStartTimeUTC, pointType, startTimeUTC)
 
 
+def writeHistoryBatchCsv(csvPath, points: list[Point], mirroredKeys=frozenset()):
+    """Appends a batch of history points to the CSV cache, for recovery/inspection.
+
+    Points already mirrored by the running daemon are skipped, so the shared
+    account file does not accumulate a second copy of them. csvPath is None when
+    the CSV cache is disabled, in which case history goes only to the database.
+    """
+    if csvPath is None:
+        return
+    fresh = [pt for pt in points if pointKey(pt) not in mirroredKeys]
+    if fresh:
+        writeCsvPoints(csvPath, fresh)
+
+
+def fetchHistoryRange(config, account, usages, rangeStartUTC, rangeEndUTC, csvPath, usageDataPoints, pauseEvent,
+                      mirroredKeys=frozenset()):
+    """Fetch history from the Emporia API for a single [start, stop] range.
+
+    Batches the range into <=20-day increments, persisting each batch to the CSV
+    cache (first, so a failed database write still leaves a recoverable file) and
+    to the database, then clearing it from memory. usageDataPoints is reused as the
+    per-batch buffer and is left empty on return.
+
+    Returns (pointsWritten, earliestDataUTC, lastCompletedStopUTC, aborted) where
+    lastCompletedStopUTC is how far coverage may be safely advanced (== the last
+    batch's stop, or rangeStartUTC if nothing completed).
+    """
+    totalDays = max(1, (rangeEndUTC - rangeStartUTC).days)
+    totalBatches = max(1, -(-totalDays // 20))  # ceil; matches 20-day increments in calculateHistoryTimeRange
+    logger.info('Fetching uncovered history from API; start={}; stop={}; batches={}'.format(
+                rangeStartUTC, rangeEndUTC, totalBatches))
+
+    pointsWritten = 0
+    earliestDataUTC = None
+    lastCompletedStopUTC = rangeStartUTC
+    aborted = False
+    batchCounter = 0
+    while True:
+        # Anchor the 20-day windows at rangeStartUTC and clamp the stop to rangeEndUTC.
+        incrementStartTimeUTC, incrementEndTimeUTC = calculateHistoryTimeRange(config, rangeEndUTC, rangeStartUTC,
+                                                                               batchCounter)
+        if incrementStartTimeUTC >= rangeEndUTC:
+            break
+
+        logger.info('History batch {}/{}; start={}; stop={}'.format(
+                    batchCounter + 1, totalBatches, incrementStartTimeUTC, incrementEndTimeUTC))
+        for gid, device in usages.items():
+            extractDataPoints(config, account, device, rangeEndUTC, False, usageDataPoints, None,
+                              'History', incrementStartTimeUTC, incrementEndTimeUTC)
+
+        if usageDataPoints:
+            batchEarliest = min(pt.timestamp for pt in usageDataPoints)
+            if earliestDataUTC is None or batchEarliest < earliestDataUTC:
+                earliestDataUTC = batchEarliest
+
+        batchPoints = len(usageDataPoints)
+        pointsWritten += batchPoints
+        writeHistoryBatchCsv(csvPath, usageDataPoints, mirroredKeys)
+        writeDataPoints(config, usageDataPoints)
+        del usageDataPoints[:]
+        lastCompletedStopUTC = incrementEndTimeUTC
+        logger.info('History batch {}/{} complete; batchPoints={}; totalPoints={}'.format(
+                    batchCounter + 1, totalBatches, batchPoints, pointsWritten))
+
+        batchCounter = batchCounter + 1
+
+        if pauseEvent.wait(5):
+            logging.info("Aborting history collection due to pause interruption")
+            aborted = True
+            break
+
+    return pointsWritten, earliestDataUTC, lastCompletedStopUTC, aborted
+
+
 def collectHistoryUsage(config, account, startTimeUTC, stopTimeUTC, usageDataPoints: list[Point], pauseEvent):
-    """Module entrypoint. Fetches historic Vue data and unpacks it into points."""
+    """Module entrypoint. Populates the database with historic Vue data.
+
+    When the CSV cache is disabled (the default) the requested range is simply
+    fetched from the Emporia API in batches and written to the database.
+
+    When 'csvCacheEnabled' is set, the backfill CSV files act as a passthrough
+    cache in front of the Emporia history API (see vuegraf.cache):
+      1. Any part of the requested range already probed (per the cache manifest)
+         is restored straight from CSV into the database -- no API calls. Restore can
+         be skipped with --skiprestore when the database is known to be populated.
+      2. Only the uncovered portion(s) of the requested range are fetched from
+         the API (the "true-up"), appended to the cache, and written to the database.
+      3. The manifest coverage is extended to include everything probed --
+         including windows that returned no data -- so future runs never re-probe
+         the empty pre-install era, regardless of the --historydays range used.
+    """
     # Grab base usage data for later use in history collection
     deviceGids = list(account['deviceIdMap'].keys())
     usages = account['vue'].get_device_list_usage(deviceGids, stopTimeUTC, scale=Scale.MINUTE.value, unit=Unit.KWH.value)
 
-    historicBatchCounter = 0
-    while True:
-        # Determine history start and end times for this batch
-        incrementStartTimeUTC, incrementEndTimeUTC = calculateHistoryTimeRange(config, stopTimeUTC, startTimeUTC,
-                                                                               historicBatchCounter)
-        if incrementStartTimeUTC >= stopTimeUTC:
+    cacheEnabled = isCacheEnabled(config)
+
+    # Resolve current cache coverage (bootstrapping from existing CSVs the first time).
+    manifest = None
+    if cacheEnabled:
+        manifest = loadManifest(config, account)
+    if cacheEnabled and manifest is None:
+        bootstrapped = bootstrapManifestFromCsvs(config, account)
+        if bootstrapped is not None:
+            covStart, covEnd, earliestData = bootstrapped
+            manifest = {'coveredStartUTC': covStart, 'coveredEndUTC': covEnd, 'earliestDataUTC': earliestData}
+            logger.info('Bootstrapped history cache from existing CSVs; data={}..{}'.format(earliestData, covEnd))
+
+    covStartUTC = manifest['coveredStartUTC'] if manifest else None
+    covEndUTC = manifest['coveredEndUTC'] if manifest else None
+    earliestDataUTC = manifest['earliestDataUTC'] if manifest else None
+
+    logger.info('History collection started; requested={}..{}; cachedCoverage={}..{}'.format(
+                startTimeUTC, stopTimeUTC, covStartUTC, covEndUTC))
+
+    # 1) Serve the already-cached portion of the request from CSV into the database (no API calls).
+    skipRestore = getattr(config.get('args'), 'skiprestore', False)
+    if manifest and not skipRestore:
+        restoreStartUTC = max(startTimeUTC, covStartUTC)
+        restoreStopUTC = min(stopTimeUTC, covEndUTC)
+        if restoreStartUTC < restoreStopUTC:
+            logger.info('Restoring cached history from CSV; start={}; stop={}'.format(restoreStartUTC, restoreStopUTC))
+            restored = restoreCacheToDatabase(config, account, restoreStartUTC, restoreStopUTC)
+            logger.info('Restored {} cached points from CSV (no API calls)'.format(restored))
+    elif manifest and skipRestore:
+        logger.info('Skipping CSV restore (--skiprestore); cached range assumed already present in the database')
+
+    # 2) Fetch only the uncovered portion(s) from the API and append them to the cache.
+    gaps = subtractCoverage(startTimeUTC, stopTimeUTC, covStartUTC, covEndUTC)
+    if not gaps:
+        logger.info('History cache fully covers the requested range; no API calls needed')
+
+    csvPath = getCacheCsvPath(config, account) if cacheEnabled else None
+    coveredPieces = []
+    if covStartUTC is not None and covEndUTC is not None:
+        coveredPieces.append((covStartUTC, covEndUTC))
+
+    # Readings the daemon already mirrored into the shared file, so the batches
+    # below do not append a second copy of them.
+    mirroredKeys = loadMirroredKeys(config, account, covEndUTC) if cacheEnabled else frozenset()
+
+    for gapStartUTC, gapEndUTC in gaps:
+        _, dataMinUTC, lastStopUTC, aborted = fetchHistoryRange(
+            config, account, usages, gapStartUTC, gapEndUTC, csvPath, usageDataPoints, pauseEvent, mirroredKeys)
+        if dataMinUTC is not None and (earliestDataUTC is None or dataMinUTC < earliestDataUTC):
+            earliestDataUTC = dataMinUTC
+        # Only claim coverage for what actually completed (matters if aborted mid-gap).
+        if lastStopUTC > gapStartUTC:
+            coveredPieces.append((gapStartUTC, lastStopUTC))
+        if aborted:
             break
 
-        # Collect usage data for the historical period
-        logger.debug('Collecting history data from Emporia; incrementStartTimeUTC={}; incrementEndTimeUTC={}'.format(
-                     incrementStartTimeUTC, incrementEndTimeUTC))
-        for gid, device in usages.items():
-            extractDataPoints(config, account, device, stopTimeUTC, False, usageDataPoints, None,
-                              'History', incrementStartTimeUTC, incrementEndTimeUTC)
+    # 3) Persist the merged coverage. Pieces are contiguous by construction, so the
+    #    union is simply [min start, max stop]. Empty (probed-but-no-data) windows are
+    #    included, so they are never re-probed on future runs.
+    if cacheEnabled and coveredPieces:
+        newCovStartUTC = min(s for s, _ in coveredPieces)
+        newCovEndUTC = max(e for _, e in coveredPieces)
+        saveManifest(config, account, newCovStartUTC, newCovEndUTC, earliestDataUTC)
 
-        historicBatchCounter = historicBatchCounter + 1
-
-        if pauseEvent.wait(5):
-            logging.info("Aborting history collection due to pause interruption")
-            break
+    logger.info('History collection finished; csv={}'.format(csvPath))

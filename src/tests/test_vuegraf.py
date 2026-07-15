@@ -28,7 +28,8 @@ DUMMY_CONFIG = {
     'accounts': [{'email': 'test@example.com'}],
     'influx': {'host': 'localhost', 'port': 8086},
     'vue': {'connectTimeoutSecs': 5, 'readTimeoutSecs': 15},
-    'system': {'timezone': 'UTC'}  # Only timezone needed directly by getCurrentDayLocal mock
+    'system': {'timezone': 'UTC'},  # Only timezone needed directly by getCurrentDayLocal mock
+    'csvCacheEnabled': False  # Read by the cache module directly, not via the mocked getConfigValue
 }
 
 
@@ -428,6 +429,70 @@ class TestVuegraf(unittest.TestCase):
         mock_logger.debug.assert_called_once()
         self.assertIn('collectDetails=True', mock_logger.debug.call_args[0][0])
 
+    @patch('vuegraf.vuegraf.writeRollupPoints')
+    @patch('vuegraf.vuegraf.initConfig')
+    @patch('vuegraf.vuegraf.initConnection')
+    @patch('vuegraf.vuegraf.initDeviceAccount')
+    @patch('vuegraf.vuegraf.collectUsage')
+    @patch('vuegraf.vuegraf.writeDataPoints')
+    @patch('vuegraf.vuegraf.getTimeNow')
+    @patch('vuegraf.vuegraf.getCurrentHourUTC')
+    @patch('vuegraf.vuegraf.getCurrentDayLocal')
+    @patch('vuegraf.vuegraf.pauseEvent')
+    @patch('vuegraf.vuegraf.logger')
+    @patch('vuegraf.vuegraf.getConfigValue')
+    def test_run_mirrors_only_rollup_points_to_csv(  # pylint: disable=too-many-arguments,too-many-locals
+            self, mock_get_config_value, mock_logger, mock_pause_event,
+            mock_get_day, mock_get_hour, mock_get_time, mock_write_points,
+            mock_collect_usage, mock_init_device, mock_init_connection,
+            mock_init_config, mock_write_rollup):
+        """The CSV mirror receives the hourly/daily rollups but never the minute points."""
+        test_config = DUMMY_CONFIG.copy()
+        test_config['args'] = MagicMock(historydays=0)
+
+        config_values = {
+            'maxHistoryDays': 30, 'updateIntervalSecs': 60,
+            'detailedIntervalSecs': 300, 'detailedDataEnabled': True,
+            'detailedDataDaysEnabled': True, 'detailedDataHoursEnabled': True,
+            'lagSecs': 60
+        }
+        mock_get_config_value.side_effect = lambda cfg, key: config_values.get(key, MagicMock())
+        mock_init_config.return_value = test_config
+
+        Scale = MagicMock()  # pylint: disable=invalid-name
+        Scale.MINUTE.value = '1MIN'
+        Scale.HOUR.value = '1H'
+        Scale.DAY.value = '1D'
+
+        # Tag each collected point with the scale that produced it, so we can assert
+        # exactly which ones reach the mirror.
+        def collect_side_effect(_config, _account, _start, _stop, _details, points, _detailedStart, scale):
+            points.append('point-{}'.format(scale))
+
+        mock_collect_usage.side_effect = collect_side_effect
+
+        # Advance both the hour and the local day so both rollups are collected.
+        mock_get_hour.side_effect = [12, 13]
+        day1 = datetime.datetime(2025, 4, 1, tzinfo=datetime.timezone.utc)
+        day2 = datetime.datetime(2025, 4, 2, tzinfo=datetime.timezone.utc)
+        mock_get_day.side_effect = [day1, day2]
+
+        mock_pause_event.wait.side_effect = lambda _: setattr(vuegraf, 'running', False)
+        mock_get_time.return_value = datetime.datetime(
+            2025, 4, 2, 0, 0, 0, tzinfo=datetime.timezone.utc
+        )
+
+        with patch('vuegraf.vuegraf.Scale', Scale):
+            vuegraf.run()
+
+        # All three scales were collected and everything was written to InfluxDB...
+        self.assertEqual(mock_collect_usage.call_count, 3)
+        mock_write_points.assert_called_once_with(
+            test_config, ['point-1MIN', 'point-1H', 'point-1D'])
+        # ...but only the hour/day rollups were mirrored to the CSV.
+        mock_write_rollup.assert_called_once_with(
+            test_config, test_config['accounts'][0], ['point-1H', 'point-1D'])
+
     @patch('vuegraf.vuegraf.initConfig')
     @patch('vuegraf.vuegraf.initConnection')
     @patch('vuegraf.vuegraf.initDeviceAccount')  # Mock to trigger exit
@@ -452,7 +517,8 @@ class TestVuegraf(unittest.TestCase):
             'accounts': [{'email': 'test1@example.com'}, {'email': 'test2@example.com'}],
             'influx': {'host': 'localhost', 'port': 8086},
             'vue': {'connectTimeoutSecs': 5, 'readTimeoutSecs': 15},
-            'system': {'timezone': 'UTC'}
+            'system': {'timezone': 'UTC'},
+            'csvCacheEnabled': False
         }
 
         config_values = {

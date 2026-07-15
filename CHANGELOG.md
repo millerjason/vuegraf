@@ -6,6 +6,7 @@
 ## New features
 - Added image to GHCR - @jertel
 - Added support for writing directly to VictoriaMetrics, configured via a `victoriaMetrics` section. May replace InfluxDB or run alongside it, in which case each database receives only the data points it is missing - @clara-j
+- Added an optional CSV cache, enabled with the new `csvCacheEnabled` setting and written to the directory named by `csvCacheDir` (default `backfill`). Each account gets a single CSV that both collection paths append to: historical backfill writes each fetched batch, and hourly/daily averages are mirrored as they are collected, so the file stays as current as InfluxDB and can be loaded directly into pandas or a spreadsheet. A per-account coverage manifest lets a re-run restore already-collected ranges from the CSV instead of re-querying the Emporia API, so repeating `--historydays` only fetches data outside the cached range and interrupted backfills are resumable. Add `--skiprestore` to skip the CSV-to-database restore and only true-up the newest data.
 
 ## Other changes
 - Added missing DetailedDataEnabled variable values: Day, Hour - @jertel
