@@ -25,6 +25,7 @@ from vuegraf.cache import (
 )
 from vuegraf.config import getConfigValue, getInfluxTag
 from vuegraf.device import lookupDeviceName, lookupChannelName
+from vuegraf.hierarchy import applyBalances, registerImplicitEdge
 from vuegraf.influx import getLastDBTimeStamp, writeInfluxPoints
 from vuegraf.time import calculateHistoryTimeRange, convertToLocalDayInUTC
 
@@ -94,7 +95,12 @@ def extractDataPoints(config, account, device, stopTimeUTC, collectDetails, usag
 
     for chanNum, chan in device.channels.items():
         if chan.nested_devices:
+            # Emporia reports its own nesting only on usage responses, so this is where the
+            # implicit edges become visible. Registering them here folds them into the same
+            # tree as the config-declared ones. No-op unless the account opted in.
+            nestedParentChanName = lookupChannelName(account, chan)
             for gid, nestedDevice in chan.nested_devices.items():
+                registerImplicitEdge(config, accountName, lookupDeviceName(account, gid), nestedParentChanName)
                 extractDataPoints(config, account, nestedDevice, stopTimeUTC, collectDetails, usageDataPoints,
                                   detailedStartTimeUTC, pointType, historyStartTimeUTC, historyEndTimeUTC)
 
@@ -316,6 +322,11 @@ def fetchHistoryRange(config, account, usages, rangeStartUTC, rangeEndUTC, csvPa
         for gid, device in usages.items():
             extractDataPoints(config, account, device, rangeEndUTC, False, usageDataPoints, None,
                               'History', incrementStartTimeUTC, incrementEndTimeUTC)
+
+        # A batch already holds every device for its window, so the balance pass runs per
+        # batch with no cross-batch state. Appending here, before the writes below, is what
+        # gets the Net Balance series into both the CSV mirror and InfluxDB.
+        applyBalances(config, usageDataPoints)
 
         if usageDataPoints:
             batchEarliest = min(pt.timestamp for pt in usageDataPoints)

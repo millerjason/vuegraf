@@ -47,6 +47,47 @@ def getInfluxTag(config):
     return tagName, tagValue_second, tagValue_minute, tagValue_hour, tagValue_day
 
 
+def isHierarchyConfigured(account):
+    """True when an account opts into the device hierarchy / Net Balance feature.
+
+    Declaring a 'parent' on any device is enough; "hierarchyEnabled": true turns it on
+    for an account whose tree comes entirely from Emporia's own nesting.
+    """
+    devices = account.get('devices') or []
+    return bool(account.get('hierarchyEnabled', False)) or any('parent' in device for device in devices)
+
+
+def validateHierarchyConfig(config):
+    """Cheap structural checks on the optional per-device 'parent' entries.
+
+    Only the accounts that opt in are checked, so existing configs are untouched.
+    Parent names cannot be resolved yet -- they may refer to a channel or a device that
+    is only known after discovery -- so the authoritative pass (parents exist, no
+    cycles) runs later, in device.validateHierarchy.
+    """
+    for account in config.get('accounts', []):
+        if not isHierarchyConfigured(account):
+            continue
+        accountName = account.get('name', '<unnamed>')
+        seenNames = set()
+        for device in account.get('devices') or []:
+            name = device.get('name')
+            if not isinstance(name, str) or not name:
+                raise ValueError('Hierarchy config error in account "{}": every device must have a name'.format(accountName))
+            if name in seenNames:
+                raise ValueError('Hierarchy config error in account "{}": duplicate device name "{}"'.format(
+                                 accountName, name))
+            seenNames.add(name)
+            if 'parent' in device:
+                parent = device['parent']
+                if not isinstance(parent, str) or not parent:
+                    raise ValueError('Hierarchy config error in account "{}": "parent" of device "{}" must be a '
+                                     'non-empty string'.format(accountName, name))
+                if parent == name:
+                    raise ValueError('Hierarchy config error in account "{}": device "{}" cannot be its own '
+                                     'parent'.format(accountName, name))
+
+
 def initArgs():
     parser = argparse.ArgumentParser(
         prog='vuegraf.py',
@@ -128,6 +169,13 @@ def initConfig():
     setConfigDefault(config, 'timezone', None)
     setConfigDefault(config, 'maxHistoryDays', 720)
     setConfigDefault(config, 'updateIntervalSecs', 60)
+    # Hierarchy / Net Balance settings, consulted only by accounts that opt in via a
+    # device 'parent' or "hierarchyEnabled": true.
+    setConfigDefault(config, 'hierarchyNegativeBalanceAbort', False)
+    setConfigDefault(config, 'hierarchyBalanceEpsilonWatts', 5.0)
+    setConfigDefault(config, 'hierarchyAggregateSettleSecs', 120)
+
+    validateHierarchyConfig(config)
 
     # Create a sanitized copy for logging and remove sensitive information from it
     sanitized_config = config.copy()
