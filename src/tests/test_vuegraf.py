@@ -493,6 +493,104 @@ class TestVuegraf(unittest.TestCase):
         mock_write_rollup.assert_called_once_with(
             test_config, test_config['accounts'][0], ['point-1H', 'point-1D'])
 
+    def _runRolloverLoop(self, mocks, settled=True, balanceSideEffect=None):
+        """Drives one run() iteration in which both the hour and the local day roll over."""
+        (mock_get_config_value, mock_pause_event, mock_get_day, mock_get_hour,
+         mock_get_time, mock_collect_usage, mock_init_config) = mocks
+
+        test_config = DUMMY_CONFIG.copy()
+        test_config['args'] = MagicMock(historydays=0)
+        config_values = {
+            'maxHistoryDays': 30, 'updateIntervalSecs': 60,
+            'detailedIntervalSecs': 300, 'detailedDataEnabled': True,
+            'detailedDataDaysEnabled': True, 'detailedDataHoursEnabled': True,
+            'lagSecs': 60
+        }
+        mock_get_config_value.side_effect = lambda cfg, key: config_values.get(key, MagicMock())
+        mock_init_config.return_value = test_config
+
+        Scale = MagicMock()  # pylint: disable=invalid-name
+        Scale.MINUTE.value = '1MIN'
+        Scale.HOUR.value = '1H'
+        Scale.DAY.value = '1D'
+
+        def collect_side_effect(_config, _account, _start, _stop, _details, points, _detailedStart, scale):
+            points.append('point-{}'.format(scale))
+
+        mock_collect_usage.side_effect = collect_side_effect
+        mock_get_hour.side_effect = [12, 13]
+        mock_get_day.side_effect = [
+            datetime.datetime(2025, 4, 1, tzinfo=datetime.timezone.utc),
+            datetime.datetime(2025, 4, 2, tzinfo=datetime.timezone.utc),
+        ]
+        mock_pause_event.wait.side_effect = lambda _: setattr(vuegraf, 'running', False)
+        mock_get_time.return_value = datetime.datetime(2025, 4, 2, 0, 0, 0, tzinfo=datetime.timezone.utc)
+
+        with patch('vuegraf.vuegraf.Scale', Scale), \
+                patch('vuegraf.vuegraf.isAggregateSettled', return_value=settled), \
+                patch('vuegraf.vuegraf.applyBalances', side_effect=balanceSideEffect) as mock_balances:
+            vuegraf.run()
+        return test_config, mock_balances
+
+    @patch('vuegraf.vuegraf.writeRollupPoints')
+    @patch('vuegraf.vuegraf.initConfig')
+    @patch('vuegraf.vuegraf.initConnection')
+    @patch('vuegraf.vuegraf.initDeviceAccount')
+    @patch('vuegraf.vuegraf.collectUsage')
+    @patch('vuegraf.vuegraf.writeDataPoints')
+    @patch('vuegraf.vuegraf.getTimeNow')
+    @patch('vuegraf.vuegraf.getCurrentHourUTC')
+    @patch('vuegraf.vuegraf.getCurrentDayLocal')
+    @patch('vuegraf.vuegraf.pauseEvent')
+    @patch('vuegraf.vuegraf.logger')
+    @patch('vuegraf.vuegraf.getConfigValue')
+    def test_run_defers_rollups_until_the_aggregates_settle(  # pylint: disable=too-many-arguments,too-many-locals
+            self, mock_get_config_value, mock_logger, mock_pause_event,
+            mock_get_day, mock_get_hour, mock_get_time, mock_write_points,
+            mock_collect_usage, mock_init_device, mock_init_influx,
+            mock_init_config, mock_write_rollup):
+        """An unsettled period is left for a later cycle rather than collected early."""
+        test_config, _ = self._runRolloverLoop(
+            (mock_get_config_value, mock_pause_event, mock_get_day, mock_get_hour,
+             mock_get_time, mock_collect_usage, mock_init_config), settled=False)
+
+        # Only the minute collection ran; neither rollover was collected.
+        self.assertEqual(mock_collect_usage.call_count, 1)
+        mock_write_points.assert_called_once_with(test_config, ['point-1MIN'])
+        mock_write_rollup.assert_called_once_with(test_config, test_config['accounts'][0], [])
+
+    @patch('vuegraf.vuegraf.writeRollupPoints')
+    @patch('vuegraf.vuegraf.initConfig')
+    @patch('vuegraf.vuegraf.initConnection')
+    @patch('vuegraf.vuegraf.initDeviceAccount')
+    @patch('vuegraf.vuegraf.collectUsage')
+    @patch('vuegraf.vuegraf.writeDataPoints')
+    @patch('vuegraf.vuegraf.getTimeNow')
+    @patch('vuegraf.vuegraf.getCurrentHourUTC')
+    @patch('vuegraf.vuegraf.getCurrentDayLocal')
+    @patch('vuegraf.vuegraf.pauseEvent')
+    @patch('vuegraf.vuegraf.logger')
+    @patch('vuegraf.vuegraf.getConfigValue')
+    def test_run_balances_rollups_before_mirroring_them(  # pylint: disable=too-many-arguments,too-many-locals
+            self, mock_get_config_value, mock_logger, mock_pause_event,
+            mock_get_day, mock_get_hour, mock_get_time, mock_write_points,
+            mock_collect_usage, mock_init_device, mock_init_influx,
+            mock_init_config, mock_write_rollup):
+        """Net Balance points reach both the CSV mirror and InfluxDB, and only the rollups."""
+        def appendBalance(_config, points):
+            points.append('point-balance')
+
+        test_config, mock_balances = self._runRolloverLoop(
+            (mock_get_config_value, mock_pause_event, mock_get_day, mock_get_hour,
+             mock_get_time, mock_collect_usage, mock_init_config), balanceSideEffect=appendBalance)
+
+        # Balances are computed on the rollup slice alone, never on the minute points.
+        mock_balances.assert_called_once_with(test_config, ['point-1H', 'point-1D', 'point-balance'])
+        mock_write_rollup.assert_called_once_with(
+            test_config, test_config['accounts'][0], ['point-1H', 'point-1D', 'point-balance'])
+        mock_write_points.assert_called_once_with(
+            test_config, ['point-1MIN', 'point-1H', 'point-1D', 'point-balance'])
+
     @patch('vuegraf.vuegraf.initConfig')
     @patch('vuegraf.vuegraf.initConnection')
     @patch('vuegraf.vuegraf.initDeviceAccount')  # Mock to trigger exit

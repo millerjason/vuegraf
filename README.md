@@ -251,6 +251,148 @@ You can also explicity define the channel and circuit names by using a dictionar
             ]
 ```
 
+### Device Hierarchy and Net Balance
+
+Emporia allows devices to be nested: smart plugs under a circuit, and circuits feeding subpanels. A real installation is therefore a tree, but Vuegraf records every device and channel as an independent, flat series, with no notion that one reading is physically a subset of another. That leads to two problems:
+
+- **Double counting.** A subpanel's energy is measured by the parent's feed circuit *and* by the subpanel device (and again by the subpanel's own circuits), so naively summing device series counts the same watts two or three times. Correct totals require hand-maintained exclusion lists in your queries.
+- **No true balance.** Emporia's per-device `Balance` channel nets out only that one device's own circuits. It does not subtract a separately measured subpanel or plug, so no series answers "how much did this panel use that isn't already itemized somewhere below it?"
+
+This feature is **off by default**. Describe your panel tree once in the configuration and Vuegraf will emit a correct per-level balance for both live and historical data. It is purely additive: raw Emporia readings, including the native `Balance` channel, are written unchanged.
+
+#### Declaring the tree
+
+Add an optional `parent` to any device in the account's `devices` list. A `parent` may name another device *or* a channel/circuit name, since a single circuit can feed several plugs or a subpanel:
+
+```json
+            "devices": [
+                { "name": "Main Panel", "channels": ["Heat Pump", "Garage Feed", "Media Circuit"] },
+
+                { "name": "Garage Subpanel", "parent": "Garage Feed", "channels": ["Garage Lights", "Freezer"] },
+
+                { "name": "TV Console",   "parent": "Media Circuit" },
+                { "name": "Network Rack", "parent": "Media Circuit" },
+
+                { "name": "Sump Pump", "parent": "Main Panel" }
+            ]
+```
+
+That configuration describes this tree. `Main Panel` and `Garage Subpanel` are Vue devices; `Heat Pump`, `Garage Feed`, and `Media Circuit` are circuits on the main panel; the last three are smart plugs:
+
+```
+Main Panel                        (device, mains)
+├── Heat Pump                     (circuit, leaf)
+├── Garage Feed                   (circuit, feeds the subpanel)
+│   └── Garage Subpanel           (device, mains)
+│       ├── Garage Lights         (circuit, leaf)
+│       └── Freezer               (circuit, leaf)
+├── Media Circuit                 (circuit, feeds two plugs)
+│   ├── TV Console                (plug, leaf)
+│   └── Network Rack              (plug, leaf)
+└── Sump Pump                     (plug on the panel's unmetered remainder)
+```
+
+Two things in that example are worth calling out, because they are the cases a flat series list gets wrong:
+
+- **`Garage Subpanel` hangs off `Garage Feed`, a circuit, not off `Main Panel` directly.** The subpanel's energy is physically measured twice — once by the feed circuit in the main panel, once by the subpanel's own mains. Naming the circuit as the parent is what tells Vuegraf those two readings are the same watts.
+- **`Sump Pump` hangs off `Main Panel` itself.** It is a plug on some circuit the panel does not meter individually, so its parent is the panel, and it comes out of the panel's own remainder rather than any circuit's.
+
+Edges come from two places and are merged into one tree:
+
+- **Explicit** `parent` entries from the configuration. This is the only way to express a link *across* Vue devices (subpanel to panel), which Emporia does not report.
+- **Implicit** edges from the nested devices Emporia reports for plugs it natively nests inside a single device.
+
+Where both exist and disagree, the explicit configuration wins and a warning is logged once.
+
+If your account's tree comes entirely from Emporia's own nesting and needs no `parent` entries, turn the feature on for that account with `"hierarchyEnabled": true` alongside `devices`.
+
+#### What gets written
+
+For every node that has children, Vuegraf writes a new channel series named `<node> Net Balance`:
+
+```
+Net Balance(node) = total(node) - sum(total(child) for each direct child)
+```
+
+A panel or subpanel's total is its mains (`1,2,3`) reading; a circuit's total is its channel reading. A circuit that feeds children therefore gets its own balance, which is the portion of that circuit not itemized by the plug or subpanel below it. Leaf nodes have nothing beneath them, so they get no balance series.
+
+Summing every `Net Balance` series plus the totals of every leaf reconstructs your whole-home total with nothing counted twice — no query-side exclusion lists.
+
+##### A worked example
+
+Take the tree above, and suppose one hour is collected with these readings (average watts):
+
+| Series | Reading |
+|---|---|
+| `Main Panel` (mains) | 4000 |
+| `Heat Pump` | 1500 |
+| `Garage Feed` | 900 |
+| `Garage Subpanel` (mains) | 800 |
+| `Garage Lights` | 100 |
+| `Freezer` | 250 |
+| `Media Circuit` | 400 |
+| `TV Console` | 150 |
+| `Network Rack` | 200 |
+| `Sump Pump` | 300 |
+
+Vuegraf adds one `Net Balance` series per node that has children:
+
+| New series | Arithmetic | Value |
+|---|---|---|
+| `Main Panel Net Balance` | 4000 − (1500 + 900 + 400 + 300) | 900 |
+| `Garage Feed Net Balance` | 900 − 800 | 100 |
+| `Garage Subpanel Net Balance` | 800 − (100 + 250) | 450 |
+| `Media Circuit Net Balance` | 400 − (150 + 200) | 50 |
+
+Read them as "energy at this level that nothing below it accounts for": 900 W of main-panel load on circuits with no CT at all, 100 W lost in or tapped off the garage feed before the subpanel, 450 W of unmetered garage circuits, and 50 W on the media circuit that is not the TV or the rack.
+
+The four balances plus the six leaves total exactly 4000 W — the main panel reading, reconstructed with nothing double counted:
+
+```
+900 + 100 + 450 + 50                          (balances)
+  + 1500 + 100 + 250 + 150 + 200 + 300        (leaves)
+= 4000
+```
+
+Naively summing the ten raw series instead gives 8600 W, because the subpanel, its feed, and the plugs are each counted at two or three levels.
+
+If your service has more than one top-level panel (dual mains), Vuegraf synthesizes a virtual root named `<account> Panel` and writes the sum of those panels under that name, giving you a single correct whole-account total. Emporia has no way to express a root above independent mains.
+
+#### Scope: hourly and daily only
+
+Balance is a subtraction across nodes, so it is only meaningful when a node and all of its children are sampled at the same instant. Hourly and daily points are collected once per period rollover, for the just-closed period, in a single API call — so every device lands one point at the same timestamp for a period that is already complete. Per-minute points are produced by a per-channel path that does not line up within a cycle, so **no minute-resolution Net Balance is emitted**.
+
+Both the live rollover and the `--historydays` backfill produce these aligned groups, so both are covered. With the CSV cache enabled, the balances flow into the CSV automatically, since they are appended to the same list that gets written.
+
+#### Settings
+
+```
+hierarchyBalanceEpsilonWatts: 5.0
+hierarchyNegativeBalanceAbort: false
+hierarchyAggregateSettleSecs: 120
+```
+
+- `hierarchyBalanceEpsilonWatts` (default `5.0`): a negative balance smaller than this is treated as rounding noise and clamped silently.
+- `hierarchyNegativeBalanceAbort` (default `false`): a balance more negative than the epsilon means a child is measuring more than its parent, which usually means the tree is wrong. By default this logs a warning (at most once per node per hour) and clamps the emitted value to zero. Set this to `true` to raise instead, failing the collection cycle loudly.
+- `hierarchyAggregateSettleSecs` (default `120`, capped at 1800): how long to wait after a period closes before collecting it, giving Emporia time to finalize its averages. Only applied when a hierarchy is active; the deferred period is picked up on a later cycle.
+
+A `parent` that does not resolve to a real device or channel, a cycle in the tree, or a name that refers to both a device and a channel is reported at startup with the offending node named, rather than silently producing wrong balances.
+
+#### Enabling the hierarchy
+
+Nothing about existing data changes when you turn this on: the raw Emporia series keep their names, their values, and their history. The feature only *adds* `Net Balance` series, so existing dashboards and queries keep working untouched.
+
+- **New installation.** Name your channels first (see [Channel Names](#channel-names)), then declare the tree. Balances are emitted from the first hourly rollover onward.
+- **Existing installation.** Add the `parent` entries and restart. Vuegraf computes balances only for points it collects from then on, so the new series begin at that moment and existing points get no balance retroactively. To fill them in for data you already have, re-run once with `--historydays`; re-written points overwrite the existing ones in InfluxDB rather than duplicating them.
+- **Upgrading Vuegraf without configuring a tree.** The feature stays off, and collection behaves exactly as before. It activates only when an account declares a `parent` or sets `"hierarchyEnabled": true`.
+
+Two things to check before declaring a tree on an established installation:
+
+- **Node names are series names.** A `parent` must name a device or channel exactly as Vuegraf names its series — which comes from `devices[].channels`, not from the Emporia app. If a device has no `channels` map, its circuits are named `<Device>-<channelNum>`, and that is the name a `parent` must use. Adding descriptive names later renames those series and forks their history, so settle the names first.
+- **Every node name must be unique.** Vuegraf refuses to start if one name refers to both a device and a channel — a common case is a feed circuit labelled with the name of the subpanel it feeds ("Garage Subpanel" as both a circuit and the Vue device). Rename one of them; in the example above the circuit is `Garage Feed` for exactly this reason.
+
+If a negative balance appears after enabling, the tree is usually claiming a child that is not actually below its parent. `hierarchyNegativeBalanceAbort` turns those warnings into hard failures while you are validating a new tree.
+
 ### Station Names
 
 If you intend to run multiple Vue systems under the same account, where the channel names duplicate or look similar across those Vue systems then you may want to consider enabling the `addStationField` config parameter. This will include an additional field named 'station_name' in the InfluxDB event record, to help distinguish channel names across those Vue systems or 'stations'.

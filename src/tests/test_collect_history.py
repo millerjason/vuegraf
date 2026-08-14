@@ -274,3 +274,83 @@ class TestCollectHistoryUsageCache(TestCase):
 
         self.mock_wip_cache.assert_not_called()  # no restore
         self.mock_extract.assert_called()        # full range fetched from the API
+
+
+class TestCollectHistoryUsageHierarchy(TestCase):
+    """The history path nets each batch before persisting it, so the CSV mirror and
+    InfluxDB both receive the Net Balance series without any extra plumbing."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._cwd = os.getcwd()
+        os.chdir(self.tmp)
+
+        self.account = {'name': 'Acct', 'deviceIdMap': {123: 'Dev'}, 'vue': MagicMock()}
+        self.account['vue'].get_device_list_usage.return_value = {123: MagicMock()}
+        self.config = {
+            'args': Namespace(skiprestore=False),
+            'csvCacheEnabled': True,
+            'csvCacheDir': 'backfill',
+            'influxDb': {},
+            'hierarchyBalanceEpsilonWatts': 5.0,
+            'hierarchyNegativeBalanceAbort': False,
+            # A panel whose single circuit is separately metered by a plug.
+            'hierarchy': {'Acct': {
+                'nodes': {
+                    'Panel': {'parent': None, 'children': ['Circuit'], 'kind': 'device',
+                              'deviceName': 'Panel', 'explicit': False},
+                    'Circuit': {'parent': 'Panel', 'children': [], 'kind': 'circuit',
+                                'deviceName': 'Panel', 'explicit': False},
+                },
+                'roots': ['Panel'], 'virtualRoot': None, 'warned': set(), 'negativeWarnExpiry': {},
+            }},
+        }
+        self.pause = MagicMock()
+        self.pause.wait.return_value = False
+        self.points = []
+
+        self.patcher_calc = patch('vuegraf.collect.calculateHistoryTimeRange')
+        self.mock_calc = self.patcher_calc.start()
+        self.patcher_extract = patch('vuegraf.collect.extractDataPoints')
+        self.mock_extract = self.patcher_extract.start()
+        self.patcher_wip_collect = patch('vuegraf.collect.writeDataPoints')
+        self.mock_wip_collect = self.patcher_wip_collect.start()
+        self.patcher_wip_cache = patch('vuegraf.cache.writeDataPoints')
+        self.mock_wip_cache = self.patcher_wip_cache.start()
+
+    def tearDown(self):
+        self.patcher_calc.stop()
+        self.patcher_extract.stop()
+        self.patcher_wip_collect.stop()
+        self.patcher_wip_cache.stop()
+        os.chdir(self._cwd)
+
+    def test_batch_balances_reach_both_influx_and_the_csv(self):
+        start, stop = _t(2023, 1, 1), _t(2023, 1, 21)
+        self.mock_calc.side_effect = [(start, stop), (stop, stop)]
+        ts = _t(2023, 1, 5, 3)
+
+        def _se(config, account, device, rangeEnd, collectDetails, usageDataPoints,
+                detailedStart, pointType, histStart, histEnd):
+            usageDataPoints.append(Point('Acct', 'Panel', 'Panel', 1000.0, ts, 'Hour'))
+            usageDataPoints.append(Point('Acct', 'Panel', 'Circuit', 400.0, ts, 'Hour'))
+        self.mock_extract.side_effect = _se
+
+        # Snapshot each batch: the list is cleared after the write to bound memory.
+        batches = []
+        self.mock_wip_collect.side_effect = lambda cfg, pts: batches.append(list(pts))
+
+        collect.collectHistoryUsage(self.config, self.account, start, stop, self.points, self.pause)
+
+        # The batch handed to InfluxDB carries the balance alongside the raw readings.
+        self.assertEqual(len(batches), 1)
+        written = batches[0]
+        balances = [pt for pt in written if pt.chanName == 'Panel Net Balance']
+        self.assertEqual(len(balances), 1)
+        self.assertEqual(balances[0].usageWatts, 600.0)  # 1000 - 400
+        self.assertEqual(len(written), 3)
+
+        # The same list is what was appended to the CSV mirror, so it is there too.
+        with open(cache.getCacheCsvPath(self.config, self.account), newline='') as f:
+            rows = list(csv.reader(f))[1:]
+        self.assertIn(['Acct', 'Panel', 'Panel Net Balance', '600.0', ts.isoformat(), 'Hour'], rows)

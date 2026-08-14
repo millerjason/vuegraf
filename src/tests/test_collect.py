@@ -777,6 +777,29 @@ class TestCollect(TestCase):
         # getLastDBTimeStamp should be called for both main and nested (if history enabled, but here it's disabled)
         self.assertEqual(self.mock_getLastDBTimeStamp.call_count, 2)
 
+    def test_extractDataPoints_registers_nested_device_as_a_hierarchy_edge(self):
+        """Emporia's own nesting is only visible here, so collection is where it is recorded."""
+        self.mock_config['data']['detailedDataMinutesHistoryEnabled'] = False
+        self.mock_getLastDBTimeStamp.return_value = (None, None, False)
+
+        # A panel channel that Emporia reports a plug nested beneath.
+        mock_device = self._create_mock_device(12345, [('1,2,3', 0.01, {67890: [('NestedChan', 0.005, None)]})])
+        self.mock_lookupDeviceName.side_effect = lambda acc, gid: 'NestedDevice' if gid == 67890 else 'TestDevice1'
+        self.mock_lookupChannelName.side_effect = self._mock_lookupChannelName
+
+        self.mock_config['hierarchy'] = {'TestAccount': {
+            'nodes': {'TestChannel1': {'parent': None, 'children': [], 'kind': 'circuit',
+                                       'deviceName': 'TestDevice1', 'explicit': False}},
+            'roots': ['TestChannel1'], 'virtualRoot': None, 'warned': set(), 'negativeWarnExpiry': {},
+        }}
+
+        collect.extractDataPoints(self.mock_config, self.mock_account, mock_device, self.stop_time_utc,
+                                  False, self.usage_data_points, self.detailed_start_time_utc)
+
+        nodes = self.mock_config['hierarchy']['TestAccount']['nodes']
+        self.assertEqual(nodes['TestChannel1']['children'], ['NestedDevice'])
+        self.assertEqual(nodes['NestedDevice']['parent'], 'TestChannel1')
+
     def test_extractDataPoints_excluded_channels(self):
         self.mock_getLastDBTimeStamp.reset_mock()  # Ensure clean state for this test
         # Test that excluded channels ('Balance', 'TotalUsage') are handled correctly
