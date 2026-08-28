@@ -169,6 +169,10 @@ def initConfig():
     setConfigDefault(config, 'timezone', None)
     setConfigDefault(config, 'maxHistoryDays', 720)
     setConfigDefault(config, 'updateIntervalSecs', 60)
+    # Off by default: a negative reading is legitimate on a solar/backfeed install, where
+    # it means export. Turn it on only when nothing in the system can produce power, so a
+    # negative value can only be a measurement fault. See collect.clampNegativeWatts.
+    setConfigDefault(config, 'clampNegativeUsage', False)
     # Hierarchy / Net Balance settings, consulted only by accounts that opt in via a
     # device 'parent' or "hierarchyEnabled": true.
     setConfigDefault(config, 'hierarchyNegativeBalanceAbort', False)

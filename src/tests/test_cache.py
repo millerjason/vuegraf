@@ -46,6 +46,27 @@ class TestSubtractCoverage(TestCase):
         )
 
 
+class TestMergeCoverage(TestCase):
+    def test_disjoint_pieces_are_sorted_and_kept_apart(self):
+        self.assertEqual(
+            cache.mergeCoverage([(_t(2023, 3, 1), _t(2023, 4, 1)), (_t(2023, 1, 1), _t(2023, 2, 1))]),
+            [(_t(2023, 1, 1), _t(2023, 2, 1)), (_t(2023, 3, 1), _t(2023, 4, 1))],
+        )
+
+    def test_abutting_and_overlapping_pieces_are_joined(self):
+        self.assertEqual(
+            cache.mergeCoverage([(_t(2023, 1, 1), _t(2023, 2, 1)), (_t(2023, 2, 1), _t(2023, 3, 1)),
+                                 (_t(2023, 2, 15), _t(2023, 4, 1))]),
+            [(_t(2023, 1, 1), _t(2023, 4, 1))],
+        )
+
+    def test_contained_piece_does_not_shrink_the_window(self):
+        self.assertEqual(
+            cache.mergeCoverage([(_t(2023, 1, 1), _t(2023, 4, 1)), (_t(2023, 2, 1), _t(2023, 3, 1))]),
+            [(_t(2023, 1, 1), _t(2023, 4, 1))],
+        )
+
+
 class TestCacheFilesystem(TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -70,6 +91,17 @@ class TestCacheFilesystem(TestCase):
     def test_account_slug_spaces_replaced(self):
         path = cache.getCacheCsvPath(self.config, self.account)
         self.assertEqual(os.path.basename(path), 'Test_Acct.csv')
+
+    def test_account_slug_cannot_escape_the_cache_dir(self):
+        """A path separator or traversal segment in the account name stays inert."""
+        cacheDir = cache.getCacheDir(self.config)
+        for name in ['../../etc/passwd', 'sub/acct', '..']:
+            for path in [cache.getCacheCsvPath(self.config, {'name': name}),
+                         cache.getManifestPath(self.config, {'name': name})]:
+                self.assertEqual(os.path.dirname(os.path.abspath(path)), cacheDir)
+
+    def test_account_slug_falls_back_when_nothing_survives(self):
+        self.assertEqual(os.path.basename(cache.getCacheCsvPath(self.config, {'name': ''})), 'account.csv')
 
     def test_cache_enabled_reflects_config(self):
         self.assertTrue(cache.isCacheEnabled(self.config))

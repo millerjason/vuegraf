@@ -41,6 +41,7 @@ import datetime
 import json
 import logging
 import os
+import re
 
 from vuegraf.config import getConfigValue
 from vuegraf.destination import writeDataPoints
@@ -71,7 +72,15 @@ def getCacheDir(config):
 
 
 def _accountSlug(account):
-    return account['name'].replace(' ', '_')
+    """A filesystem-safe stem for this account's cache files.
+
+    Account names are free text, so anything outside a conservative allowlist is
+    replaced with '_'. Dropping path separators and dots keeps a name like
+    'sub/acct' or '../../etc/cron.d/x' from steering the CSV or the manifest --
+    which saveManifest() writes with os.replace() -- outside the cache directory.
+    A name that sanitizes away entirely falls back to a fixed stem.
+    """
+    return re.sub(r'[^A-Za-z0-9_-]', '_', account['name']) or 'account'
 
 
 def getCacheCsvPath(config, account):
@@ -245,14 +254,31 @@ def subtractCoverage(reqStartUTC, reqEndUTC, covStartUTC, covEndUTC):
     return [(s, e) for (s, e) in gaps if s < e]
 
 
+def mergeCoverage(pieces):
+    """Merges (start, stop) intervals into sorted, non-overlapping intervals.
+
+    Abutting pieces (one's stop == the next one's start) are joined, since the
+    pieces describe a probed span of the timeline rather than discrete samples.
+    Used to distinguish coverage that really is contiguous from pieces separated
+    by a hole -- see the manifest handling in collect.collectHistoryUsage.
+    """
+    merged = []
+    for start, stop in sorted(pieces):
+        if merged and start <= merged[-1][1]:
+            if stop > merged[-1][1]:
+                merged[-1] = (merged[-1][0], stop)
+        else:
+            merged.append((start, stop))
+    return merged
+
+
 def restoreCacheToDatabase(config, account, rangeStartUTC, rangeEndUTC):
     """Stream cached CSV points within [rangeStart, rangeEnd] into the database.
 
     Routed through the destination layer, so the restore lands in whichever
     databases are configured. Writes are idempotent (same series+timestamp
-    overwrites), so any
-    residual duplicates in the file are harmless. Returns the number of points
-    restored.
+    overwrites), so any residual duplicates in the file are harmless. Returns
+    the number of points restored.
     """
     from vuegraf.collect import Point  # local import avoids a circular import at module load
 

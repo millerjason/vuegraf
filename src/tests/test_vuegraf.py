@@ -493,6 +493,71 @@ class TestVuegraf(unittest.TestCase):
         mock_write_rollup.assert_called_once_with(
             test_config, test_config['accounts'][0], ['point-1H', 'point-1D'])
 
+    @patch('vuegraf.vuegraf.writeRollupPoints')
+    @patch('vuegraf.vuegraf.initConfig')
+    @patch('vuegraf.vuegraf.initConnection')
+    @patch('vuegraf.vuegraf.initDeviceAccount')
+    @patch('vuegraf.vuegraf.collectUsage')
+    @patch('vuegraf.vuegraf.writeDataPoints')
+    @patch('vuegraf.vuegraf.getTimeNow')
+    @patch('vuegraf.vuegraf.getCurrentHourUTC')
+    @patch('vuegraf.vuegraf.getCurrentDayLocal')
+    @patch('vuegraf.vuegraf.pauseEvent')
+    @patch('vuegraf.vuegraf.logger')
+    @patch('vuegraf.vuegraf.getConfigValue')
+    def test_day_rollover_settles_against_the_closed_days_end(  # pylint: disable=too-many-arguments,too-many-locals
+            self, mock_get_config_value, mock_logger, mock_pause_event,
+            mock_get_day, mock_get_hour, mock_get_time, mock_write_points,
+            mock_collect_usage, mock_init_device, mock_init_influx,
+            mock_init_config, mock_write_rollup):
+        """The daily settle window is real, not bypassed by a 24h-old period end.
+
+        getCurrentDayLocal marks a day by its LAST instant (23:59:59), so at the rollover
+        the previous day's marker is one second old and the settle lag genuinely defers
+        the collection. Passing the current day's marker instead would put the period end
+        in the future and defer the rollup forever.
+        """
+        test_config = DUMMY_CONFIG.copy()
+        test_config['args'] = MagicMock(historydays=0)
+        config_values = {
+            'maxHistoryDays': 30, 'updateIntervalSecs': 60, 'detailedIntervalSecs': 300,
+            'detailedDataEnabled': True, 'detailedDataDaysEnabled': True,
+            'detailedDataHoursEnabled': False, 'lagSecs': 0,
+        }
+        mock_get_config_value.side_effect = lambda cfg, key: config_values.get(key, MagicMock())
+        mock_init_config.return_value = test_config
+
+        Scale = MagicMock()  # pylint: disable=invalid-name
+        Scale.MINUTE.value = '1MIN'
+        Scale.DAY.value = '1D'
+
+        # Real day markers: the closing instant of each local day, one second before midnight.
+        prevDay = datetime.datetime(2025, 4, 1, 23, 59, 59, tzinfo=datetime.timezone.utc)
+        curDay = datetime.datetime(2025, 4, 2, 23, 59, 59, tzinfo=datetime.timezone.utc)
+        nowUTC = datetime.datetime(2025, 4, 2, 0, 0, 0, tzinfo=datetime.timezone.utc)
+        mock_get_hour.side_effect = [12, 12]
+        mock_get_day.side_effect = [prevDay, curDay]
+        mock_get_time.return_value = nowUTC
+        mock_pause_event.wait.side_effect = lambda _: setattr(vuegraf, 'running', False)
+
+        settleCalls = []
+
+        def recordSettle(_config, periodEndUTC, now):
+            settleCalls.append((periodEndUTC, now))
+            return False
+
+        with patch('vuegraf.vuegraf.Scale', Scale), \
+                patch('vuegraf.vuegraf.isAggregateSettled', side_effect=recordSettle), \
+                patch('vuegraf.vuegraf.applyBalances'):
+            vuegraf.run()
+
+        # The period end handed to the settle check is the day that just closed, one
+        # second in the past -- so the configured lag still has to elapse.
+        self.assertEqual(settleCalls, [(prevDay, nowUTC)])
+        self.assertEqual((nowUTC - settleCalls[0][0]).total_seconds(), 1)
+        # Unsettled, so only the minute collection ran.
+        self.assertEqual(mock_collect_usage.call_count, 1)
+
     def _runRolloverLoop(self, mocks, settled=True, balanceSideEffect=None):
         """Drives one run() iteration in which both the hour and the local day roll over."""
         (mock_get_config_value, mock_pause_event, mock_get_day, mock_get_hour,
