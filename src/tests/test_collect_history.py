@@ -34,7 +34,8 @@ class TestCollectHistoryUsageCache(TestCase):
 
         self.account = {'name': 'Acct', 'deviceIdMap': {123: 'Dev'}, 'vue': MagicMock()}
         self.account['vue'].get_device_list_usage.return_value = {123: MagicMock()}
-        self.config = {'args': Namespace(skiprestore=False), 'csvCacheEnabled': True, 'csvCacheDir': 'backfill'}
+        self.config = {'args': Namespace(skiprestore=False), 'csvCacheEnabled': True,
+                       'clampNegativeUsage': False, 'csvCacheDir': 'backfill'}
         self.pause = MagicMock()
         self.pause.wait.return_value = False
         self.points = []
@@ -148,6 +149,40 @@ class TestCollectHistoryUsageCache(TestCase):
         manifest = cache.loadManifest(self.config, self.account)
         self.assertEqual(manifest['coveredStartUTC'], start)
         self.assertEqual(manifest['coveredEndUTC'], b1e)
+
+    def test_abort_in_the_older_gap_does_not_claim_the_hole_it_left(self):
+        """A partial head gap must not be merged across the unfetched middle.
+
+        Coverage [Jan 10, Jan 20] with a request for [Jan 1, Jan 30] leaves an older gap
+        [Jan 1, Jan 10]; aborting it at Jan 5 must not record [Jan 1, Jan 20] as probed,
+        or [Jan 5, Jan 10] would never be fetched again.
+        """
+        cache.saveManifest(self.config, self.account, _t(2023, 1, 10), _t(2023, 1, 20), _t(2023, 1, 11))
+        self.config['args'] = Namespace(skiprestore=True)
+        self.mock_calc.side_effect = [(_t(2023, 1, 1), _t(2023, 1, 5))]
+        self.pause.wait.side_effect = [True]
+        self._appendPoint(_t(2023, 1, 2))
+
+        collect.collectHistoryUsage(self.config, self.account, _t(2023, 1, 1), _t(2023, 1, 30), self.points, self.pause)
+
+        manifest = cache.loadManifest(self.config, self.account)
+        self.assertEqual(manifest['coveredStartUTC'], _t(2023, 1, 10))
+        self.assertEqual(manifest['coveredEndUTC'], _t(2023, 1, 20))
+
+    def test_completed_older_gap_extends_coverage_backwards(self):
+        """The same shape, but the head gap runs to completion: coverage joins up."""
+        cache.saveManifest(self.config, self.account, _t(2023, 1, 10), _t(2023, 1, 20), _t(2023, 1, 11))
+        self.config['args'] = Namespace(skiprestore=True)
+        # Head gap [Jan 1, Jan 10] completes, then the tail gap [Jan 20, Jan 30] completes.
+        self.mock_calc.side_effect = [(_t(2023, 1, 1), _t(2023, 1, 10)), (_t(2023, 1, 10), _t(2023, 1, 10)),
+                                      (_t(2023, 1, 20), _t(2023, 1, 30)), (_t(2023, 1, 30), _t(2023, 1, 30))]
+        self._appendPoint(_t(2023, 1, 2))
+
+        collect.collectHistoryUsage(self.config, self.account, _t(2023, 1, 1), _t(2023, 1, 30), self.points, self.pause)
+
+        manifest = cache.loadManifest(self.config, self.account)
+        self.assertEqual(manifest['coveredStartUTC'], _t(2023, 1, 1))
+        self.assertEqual(manifest['coveredEndUTC'], _t(2023, 1, 30))
 
     def test_multiple_batches_append_to_same_csv(self):
         start, stop = _t(2023, 1, 1), _t(2023, 2, 10)
@@ -290,6 +325,7 @@ class TestCollectHistoryUsageHierarchy(TestCase):
         self.config = {
             'args': Namespace(skiprestore=False),
             'csvCacheEnabled': True,
+            'clampNegativeUsage': False,
             'csvCacheDir': 'backfill',
             'influxDb': {},
             'hierarchyBalanceEpsilonWatts': 5.0,

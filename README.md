@@ -147,6 +147,19 @@ df = pd.read_csv('backfill/Primary_Residence.csv', parse_dates=['timestamp_utc']
 
 Since both paths share the file, a backfill covering a period the running daemon already mirrored would otherwise write those readings twice. Vuegraf avoids this at the source: before fetching, it reads back the keys already present at or after the current coverage end and skips re-appending matching readings. Readings the daemon *missed* — an hour it was down for, say — are still written, so the file does not develop holes.
 
+#### How large the file gets
+
+A row is about 74 bytes, and each series contributes one row per hour plus one per day — 9,125 rows per year, roughly 660 KiB per series per year:
+
+| Install | Series | Rows/year | 1 year | 5 years | 10 years |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| One Vue, 8 circuits | 11 | 100 K | 7 MiB | 35 MiB | 71 MiB |
+| One Vue, 16 circuits | 19 | 173 K | 12 MiB | 61 MiB | 122 MiB |
+| Two Vues, 16 circuits each, + 4 smart plugs | 42 | 383 K | 27 MiB | 135 MiB | 270 MiB |
+| Three Vues + 10 plugs, with Net Balance series | 80 | 730 K | 51 MiB | 257 MiB | 513 MiB |
+
+Restoring a range from the CSV, and reading back the already-mirrored keys, each scan the file end to end — about 1.5 seconds per 250 MiB, and only during a `--historydays` run, never during ordinary collection, which just appends.
+
 #### Resumable backfills
 
 When the cache is enabled, the history files act as a local cache in front of the Emporia history API. A small JSON manifest per account records which time range has already been collected:
@@ -378,6 +391,31 @@ Two things to check before declaring a tree on an established installation:
 
 If a negative balance appears after enabling, the tree is usually claiming a child that is not actually below its parent. `hierarchyNegativeBalanceAbort` turns those warnings into hard failures while you are validating a new tree.
 
+### Negative Readings
+
+```
+clampNegativeUsage: false
+```
+
+- `clampNegativeUsage` (default `false`): when enabled, any reading below zero is recorded
+  as zero, and a warning naming the device and channel is logged at most once per series
+  per hour.
+
+Emporia's derived `Balance` channel is the device total minus its circuits, so it goes
+negative whenever the parts read higher than the whole — a single mis-scaled channel (a
+120V circuit configured as 240V, say) or ordinary CT tolerance is enough. That is a
+measurement fault rather than energy flowing backwards, and left alone it distorts every
+sum and graph built on the series. This is the same treatment the hierarchy already gives
+its own `Net Balance`.
+
+**Leave this off if anything in your system can produce power.** On a solar or battery
+install a negative reading is legitimate — it means export — and clamping would discard
+real data. Enable it only where a negative value can only be an error.
+
+Note that clamping hides the symptom, not the cause: the throttled warning is there so a
+standing fault stays visible. A channel that keeps needing to be clamped usually has the
+wrong circuit type or multiplier configured in the Vue app.
+
 ### Station Names
 
 If you intend to run multiple Vue systems under the same account, where the channel names duplicate or look similar across those Vue systems then you may want to consider enabling the `addStationField` config parameter. This will include an additional field named 'station_name' in the InfluxDB event record, to help distinguish channel names across those Vue systems or 'stations'.
@@ -597,6 +635,22 @@ To include an Emporia smart plug in the configuration, add each plug as it's own
                 }
             ]
 ```
+
+### Plugs assigned to a circuit
+
+The Vue app lets you attach a smart plug (or a second monitor) to the circuit that feeds
+it, so its consumption is shown as part of that circuit. When you do, Emporia's
+device-list endpoint reports the parent circuit **net of** the attached device, while the
+history endpoint used by `--historydays` reports the circuit whole. Vuegraf restores the
+circuit's own total in both cases, so a circuit series always means "everything flowing
+through this circuit" and the attached device's series is the itemization of the
+sub-metered part.
+
+That keeps a backfilled hour and a live hour comparable — without it, the same hour holds
+different values depending on which path collected it — and it is what lets the
+[device hierarchy](#device-hierarchy-and-net-balance) subtract a child from its parent
+without counting it twice. Device totals (the `1,2,3` mains channel) are never adjusted;
+Emporia does not deduct attached devices from those.
 
 ## Docker Compose
 

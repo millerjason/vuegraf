@@ -175,11 +175,16 @@ def registerImplicitEdge(config, accountName, childName, parentName):
                               childName, parentName))
                 return
             ancestorName = nodes[ancestorName]['parent']
-        # The child always has a parent to detach from here. In a single-root tree every
-        # node descends from the root, so re-parenting the root itself would have been
-        # refused as a cycle just above; in a multi-root tree the roots hang off the
-        # synthesized virtual root. Detaching also keeps that virtual rollup honest.
-        nodes[child['parent']]['children'].remove(childName)
+        # Detach from the current parent, which keeps the (possibly virtual) rollup above
+        # it honest. A validated tree always has one to detach from: in a single-root tree
+        # every node descends from the root, so re-parenting the root itself would have
+        # been refused as a cycle just above, and in a multi-root tree the roots hang off
+        # the synthesized virtual root. The lookup is tolerant of a parentless node anyway,
+        # so a tree that violated that invariant re-parents instead of raising KeyError in
+        # the middle of a collection cycle.
+        currentParent = nodes.get(child['parent'])
+        if currentParent is not None:
+            currentParent['children'].remove(childName)
 
     child['parent'] = parentName
     parent['children'].append(childName)
@@ -190,9 +195,12 @@ def applyBalances(config, usageDataPoints):
     """Appends per-node Net Balance points for the hourly/daily aggregates in the list.
 
     Points are grouped by (account, timestamp, detailed tag) so that only time-aligned
-    samples are netted, and each group is indexed by node name -- a device's total is
-    its mains ('1,2,3') series, which carries the device name, and a circuit's total is
-    its channel series. For every node with children:
+    samples are netted, and each group is indexed by (device name, channel name) -- a
+    device's total is its mains ('1,2,3') series, which carries the device name, and a
+    circuit's total is its channel series. Indexing by the pair rather than the channel
+    name alone keeps two panels that use the same channel name from overwriting each
+    other's reading (device.validateHierarchy rejects such a config outright, so this is
+    a second line of defense). For every node with children:
 
         raw = total(node) - sum(total(child) for each direct child)
 
@@ -222,7 +230,7 @@ def applyBalances(config, usageDataPoints):
     groups = {}
     for pt in usageDataPoints:
         if pt.detailed in aggregateTags and hierarchies.get(pt.accountName) is not None:
-            groups.setdefault((pt.accountName, pt.timestamp, pt.detailed), {})[pt.chanName] = pt.usageWatts
+            groups.setdefault((pt.accountName, pt.timestamp, pt.detailed), {})[(pt.deviceName, pt.chanName)] = pt.usageWatts
     if not groups:
         return usageDataPoints
 
@@ -233,22 +241,28 @@ def applyBalances(config, usageDataPoints):
     suppressedWarnings = 0
     for (accountName, timestamp, detailed), totals in groups.items():
         hierarchy = hierarchies[accountName]
-        for name, node in hierarchy['nodes'].items():
+        nodes = hierarchy['nodes']
+
+        def nodeTotal(nodeName, default=None):
+            """This node's reading for the group, looked up by (device, channel)."""
+            return totals.get((nodes[nodeName]['deviceName'], nodeName), default)
+
+        for name, node in nodes.items():
             children = node['children']
             if not children:
                 continue
 
             if node['kind'] == 'virtual':
-                rootTotals = [totals[childName] for childName in children if childName in totals]
+                rootTotals = [t for t in (nodeTotal(childName) for childName in children) if t is not None]
                 if rootTotals:
                     balancePoints.append(Point(accountName, name, name, sum(rootTotals), timestamp, detailed))
                 continue
 
-            total = totals.get(name)
+            total = nodeTotal(name)
             if total is None:
                 continue
 
-            raw = total - sum(totals.get(childName, 0.0) for childName in children)
+            raw = total - sum(nodeTotal(childName, 0.0) for childName in children)
             if raw < -epsilonWatts:
                 message = ('Negative net balance for node "{}" in account "{}" at {} ({}): {:.1f}W; a child is '
                            'measuring more than its parent, so check the hierarchy configuration'.format(

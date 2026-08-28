@@ -777,6 +777,45 @@ class TestCollect(TestCase):
         # getLastDBTimeStamp should be called for both main and nested (if history enabled, but here it's disabled)
         self.assertEqual(self.mock_getLastDBTimeStamp.call_count, 2)
 
+    def test_extractDataPoints_adds_nested_device_usage_back_into_its_parent_channel(self):
+        """The device-list endpoint reports a channel net of the devices nested beneath it,
+        so taking that as the whole circuit makes the balance pass subtract them twice.
+        Collection restores the channel's own total instead."""
+        self.mock_config['data']['detailedDataMinutesHistoryEnabled'] = False
+        self.mock_getLastDBTimeStamp.return_value = (None, None, False)
+
+        # Parent circuit reports 0.01 kWh, with a plug measuring a further 0.005 deducted from it.
+        mock_device = self._create_mock_device(12345, [('1,2,3', 0.01, {67890: [('1,2,3', 0.005, None)]})])
+        self.mock_lookupDeviceName.side_effect = lambda acc, gid: 'NestedDevice' if gid == 67890 else 'TestDevice1'
+
+        collect.extractDataPoints(self.mock_config, self.mock_account, mock_device, self.stop_time_utc,
+                                  False, self.usage_data_points, self.detailed_start_time_utc)
+
+        timestamp = self.stop_time_utc.replace(second=0, microsecond=0)
+        byDevice = {pt.deviceName: pt for pt in self.usage_data_points}
+        # The parent now reports the whole circuit: its own 0.01 plus the nested 0.005.
+        self.assertAlmostEqual(byDevice['TestDevice1'].usageWatts, 900.0, places=6)
+        self.assertEqual(byDevice['TestDevice1'].timestamp, timestamp)
+        # The nested device still reports only itself, so it remains the itemization.
+        self.assertAlmostEqual(byDevice['NestedDevice'].usageWatts, 300.0, places=6)
+
+    def test_extractDataPoints_nested_device_without_a_mains_channel_adds_nothing(self):
+        """Only a nested device's mains ('1,2,3') series is its total, so one that reports
+        no mains leaves the parent channel untouched."""
+        self.mock_config['data']['detailedDataMinutesHistoryEnabled'] = False
+        self.mock_getLastDBTimeStamp.return_value = (None, None, False)
+
+        mock_device = self._create_mock_device(12345, [('1,2,3', 0.01, {67890: [('NestedChan', 0.005, None)]})])
+        self.mock_lookupDeviceName.side_effect = lambda acc, gid: 'NestedDevice' if gid == 67890 else 'TestDevice1'
+        self.mock_lookupChannelName.side_effect = self._mock_lookupChannelName
+
+        collect.extractDataPoints(self.mock_config, self.mock_account, mock_device, self.stop_time_utc,
+                                  False, self.usage_data_points, self.detailed_start_time_utc)
+
+        timestamp = self.stop_time_utc.replace(second=0, microsecond=0)
+        self.assertIn(Point('TestAccount', 'TestDevice1', 'TestChannel1', 0.01 * 60 * 1000, timestamp, 'Minutes'),
+                      self.usage_data_points)
+
     def test_extractDataPoints_registers_nested_device_as_a_hierarchy_edge(self):
         """Emporia's own nesting is only visible here, so collection is where it is recorded."""
         self.mock_config['data']['detailedDataMinutesHistoryEnabled'] = False
@@ -1104,3 +1143,51 @@ class TestCollect(TestCase):
             batch2_start,
             batch2_end
         )
+
+
+class TestClampNegativeWatts(TestCase):
+    """Opt-in clamping of negative readings (config 'clampNegativeUsage')."""
+
+    def setUp(self):
+        self.ts = datetime.datetime(2026, 8, 20, 12, 0, tzinfo=datetime.timezone.utc)
+
+    def _points(self):
+        return [Point('Acct', 'Panel', 'Panel-Balance', -52.4, self.ts, 'Hour'),
+                Point('Acct', 'Panel', 'Circuit 1', 140.0, self.ts, 'Hour')]
+
+    def _config(self, enabled):
+        return {'clampNegativeUsage': enabled}
+
+    def test_disabled_by_default_leaves_negatives_untouched(self):
+        points = self._points()
+        collect.clampNegativeWatts(self._config(False), points)
+        self.assertEqual(points[0].usageWatts, -52.4)
+
+    def test_enabled_clamps_only_the_negative_reading(self):
+        points = self._points()
+        collect.clampNegativeWatts(self._config(True), points)
+        self.assertEqual(points[0].usageWatts, 0.0)
+        self.assertEqual(points[1].usageWatts, 140.0)
+
+    def test_start_index_leaves_earlier_points_alone(self):
+        """collectUsage clamps only what the current fetch appended."""
+        points = self._points()
+        collect.clampNegativeWatts(self._config(True), points, startIndex=1)
+        self.assertEqual(points[0].usageWatts, -52.4)
+
+    def test_repeat_warnings_are_throttled_per_series(self):
+        config = self._config(True)
+        with patch('vuegraf.collect.logger') as mockLogger:
+            collect.clampNegativeWatts(config, self._points())
+            collect.clampNegativeWatts(config, self._points())
+            self.assertEqual(mockLogger.warning.call_count, 1)
+            mockLogger.info.assert_called_once()
+            self.assertIn('suppressed 1 repeat', mockLogger.info.call_args[0][0])
+
+    def test_warning_returns_after_the_throttle_expires(self):
+        config = self._config(True)
+        with patch('vuegraf.collect.logger') as mockLogger:
+            collect.clampNegativeWatts(config, self._points())
+            config['_negativeUsageWarnExpiry'] = {k: 0.0 for k in config['_negativeUsageWarnExpiry']}
+            collect.clampNegativeWatts(config, self._points())
+            self.assertEqual(mockLogger.warning.call_count, 2)

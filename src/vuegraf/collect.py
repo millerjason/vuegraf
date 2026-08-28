@@ -17,6 +17,7 @@ from vuegraf.cache import (
     isCacheEnabled,
     loadManifest,
     loadMirroredKeys,
+    mergeCoverage,
     pointKey,
     restoreCacheToInflux,
     saveManifest,
@@ -36,6 +37,10 @@ logger = logging.getLogger('vuegraf.data')
 # How long to remember that a (device, channel) returned no minute-history data,
 # before attempting the 7-day rewind backfill again. See getMinuteBackfillSkipCache().
 MINUTE_BACKFILL_SKIP_TTL_SEC = 3600  # 1 hour
+
+# How long to stay quiet about a series that keeps reporting a negative reading. Like a
+# negative net balance, a mis-scaled channel is a standing condition, not a transient one.
+NEGATIVE_USAGE_WARN_TTL_SEC = 3600  # 1 hour
 
 
 def getMinuteBackfillSkipCache(config):
@@ -77,6 +82,63 @@ class Point:
     detailed: Union[bool, str]  # 'Minutes', 'Days', etc or False
 
 
+def clampNegativeWatts(config, usageDataPoints, startIndex=0):
+    """Clamps negative readings to zero, when 'clampNegativeUsage' is enabled.
+
+    Emporia's derived channels go negative when the parts read higher than the whole:
+    'Balance' is the device total minus its circuits, so a single mis-scaled channel (a
+    120V circuit configured as 240V, say) or ordinary CT tolerance drives it below zero.
+    That is a measurement fault rather than energy flowing backwards, and leaving it in
+    the database distorts every sum and graph built on the series.
+
+    This is the same treatment the hierarchy already gives its own Net Balance: clamp to
+    zero, and warn once per series per hour so a standing fault stays visible without
+    filling the log. Applied before the balance pass, so balances are computed from the
+    clamped values.
+
+    Off by default, because a negative reading is legitimate on a solar or battery
+    install, where it means export. Enable it only when nothing in the system can produce
+    power, so a negative value can only be an error. Returns usageDataPoints.
+    """
+    if not getConfigValue(config, 'clampNegativeUsage'):
+        return usageDataPoints
+
+    expiries = config.setdefault('_negativeUsageWarnExpiry', {})
+    now = time.time()
+    clamped = 0
+    suppressed = 0
+    for point in usageDataPoints[startIndex:]:
+        if point.usageWatts >= 0.0:
+            continue
+        clamped += 1
+        key = (point.deviceName, point.chanName)
+        if expiries.get(key, 0.0) > now:
+            suppressed += 1
+        else:
+            expiries[key] = now + NEGATIVE_USAGE_WARN_TTL_SEC
+            logger.warning('Clamping negative usage to zero; device="{}"; channel="{}"; watts={:.1f}; the channels '
+                           'are measuring more than the device total, so check that channel for a wrong circuit '
+                           'type or multiplier'.format(point.deviceName, point.chanName, point.usageWatts))
+        point.usageWatts = 0.0
+    if suppressed > 0:
+        logger.info('Clamped {} negative readings; suppressed {} repeat warnings (at most one per series per {}s)'.format(
+                    clamped, suppressed, NEGATIVE_USAGE_WARN_TTL_SEC))
+    return usageDataPoints
+
+
+def nestedDeviceUsage(nestedDevice):
+    """The usage a nested device reports for itself, from its mains ('1,2,3') channel.
+
+    That channel is the device's total, so it is what a parent channel had deducted from
+    it. Missing or unreported usage counts as zero. See the note in extractDataPoints.
+    """
+    total = 0.0
+    for chanNum, chan in nestedDevice.channels.items():
+        if chanNum == '1,2,3' and chan.usage is not None:
+            total += chan.usage
+    return total
+
+
 def extractDataPoints(config, account, device, stopTimeUTC, collectDetails, usageDataPoints: list[Point],
                       detailedStartTimeUTC, pointType=None, historyStartTimeUTC=None, historyEndTimeUTC=None):
     """Unpacks Vue API usage data from a fetched device. Module use only.
@@ -94,6 +156,7 @@ def extractDataPoints(config, account, device, stopTimeUTC, collectDetails, usag
     deviceName = lookupDeviceName(account, device.device_gid)
 
     for chanNum, chan in device.channels.items():
+        nestedUsageKwh = 0.0
         if chan.nested_devices:
             # Emporia reports its own nesting only on usage responses, so this is where the
             # implicit edges become visible. Registering them here folds them into the same
@@ -101,11 +164,32 @@ def extractDataPoints(config, account, device, stopTimeUTC, collectDetails, usag
             nestedParentChanName = lookupChannelName(account, chan)
             for gid, nestedDevice in chan.nested_devices.items():
                 registerImplicitEdge(config, accountName, lookupDeviceName(account, gid), nestedParentChanName)
+                nestedUsageKwh += nestedDeviceUsage(nestedDevice)
                 extractDataPoints(config, account, nestedDevice, stopTimeUTC, collectDetails, usageDataPoints,
                                   detailedStartTimeUTC, pointType, historyStartTimeUTC, historyEndTimeUTC)
 
         chanName = lookupChannelName(account, chan)
         kwhUsage = chan.usage
+        if kwhUsage is not None:
+            # Restore this channel to its whole load. get_device_list_usage reports a
+            # channel NET of any device nested beneath it -- a plug or monitor assigned to
+            # this circuit in the app -- and declares which ones via chan.nested_devices;
+            # it is an allocation view, built so a breakdown does not double count. Taking
+            # that value as the whole circuit is what makes the balance pass subtract the
+            # same children a second time, leaving a parent short by the entire child.
+            #
+            # Restoring the total here rather than skipping the subtraction downstream also
+            # keeps one meaning for the series: get_chart_usage, which the history backfill
+            # uses, reports the raw CT reading, so otherwise a backfilled hour and a live
+            # hour would hold different measurements. It preserves the hierarchy invariant
+            # too -- device mains are never deducted, so an exclusive circuit would leave
+            # the nested load in the parent's remainder AND in the child's own series.
+            #
+            # Caveat: the deduction is floored at zero, so when a nested device measures
+            # more than its parent channel the original total cannot be recovered exactly;
+            # the reconstruction is then the sum of the children, which is the best lower
+            # bound available and errs toward a zero rather than a negative balance.
+            kwhUsage += nestedUsageKwh
         if kwhUsage is not None:
             if pointType is None:
                 # Negative-cache check: if a prior backfill window for this
@@ -267,10 +351,12 @@ def collectUsage(config, account, startTimeUTC, stopTimeUTC, collectDetails, usa
 
     deviceGids = list(account['deviceIdMap'].keys())
     usages = account['vue'].get_device_list_usage(deviceGids, stopTimeUTC, scale=scale, unit=Unit.KWH.value)
+    startIndex = len(usageDataPoints)
     if usages is not None:
         for gid, device in usages.items():
             extractDataPoints(config, account, device, stopTimeUTC, collectDetails,
                               usageDataPoints, detailedStartTimeUTC, pointType, startTimeUTC)
+    clampNegativeWatts(config, usageDataPoints, startIndex)
 
 
 def writeHistoryBatchCsv(csvPath, points: list[Point], mirroredKeys=frozenset()):
@@ -325,7 +411,9 @@ def fetchHistoryRange(config, account, usages, rangeStartUTC, rangeEndUTC, csvPa
 
         # A batch already holds every device for its window, so the balance pass runs per
         # batch with no cross-batch state. Appending here, before the writes below, is what
-        # gets the Net Balance series into both the CSV mirror and InfluxDB.
+        # gets the Net Balance series into both the CSV mirror and InfluxDB. Clamping runs
+        # first so the balances are netted from the clamped readings.
+        clampNegativeWatts(config, usageDataPoints)
         applyBalances(config, usageDataPoints)
 
         if usageDataPoints:
@@ -430,12 +518,28 @@ def collectHistoryUsage(config, account, startTimeUTC, stopTimeUTC, usageDataPoi
         if aborted:
             break
 
-    # 3) Persist the merged coverage. Pieces are contiguous by construction, so the
-    #    union is simply [min start, max stop]. Empty (probed-but-no-data) windows are
-    #    included, so they are never re-probed on future runs.
+    # 3) Persist the merged coverage. Empty (probed-but-no-data) windows are included, so
+    #    they are never re-probed on future runs.
+    #
+    #    The pieces are contiguous whenever every gap ran to completion, but an abort part
+    #    way through the older 'head' gap leaves a hole between where it stopped and the
+    #    start of the previously covered window. The manifest holds one window, so taking
+    #    [min start, max stop] there would claim that hole as probed and never fetch it
+    #    again. Instead the pieces are merged and only the window that actually contains
+    #    the coverage we started from is kept; a piece cut off before it reached that
+    #    window is dropped and re-fetched next run (its rows stay in the CSV, and Influx
+    #    writes are idempotent, so nothing is lost by re-probing it).
     if cacheEnabled and coveredPieces:
-        newCovStartUTC = min(s for s, _ in coveredPieces)
-        newCovEndUTC = max(e for _, e in coveredPieces)
+        merged = mergeCoverage(coveredPieces)
+        if covStartUTC is None:
+            newCovStartUTC, newCovEndUTC = max(merged, key=lambda piece: piece[1] - piece[0])
+        else:
+            # The pre-existing coverage is one of the pieces, so some merged window contains it.
+            newCovStartUTC, newCovEndUTC = [p for p in merged if p[0] <= covStartUTC <= p[1]][0]
+        if len(merged) > 1:
+            logger.warning('History collection ended with non-contiguous coverage; claiming {}..{} only. '
+                           'The unclaimed interval(s) will be re-fetched on the next run.'.format(
+                               newCovStartUTC, newCovEndUTC))
         saveManifest(config, account, newCovStartUTC, newCovEndUTC, earliestDataUTC)
 
     logger.info('History collection finished; csv={}'.format(csvPath))

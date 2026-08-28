@@ -82,9 +82,22 @@ def buildValidatedConfig(account=None, **overrides):
     return config
 
 
+# Which Vue device measures each node in the fixtures above. A device's mains series is
+# tagged with the device's own name; a circuit's series is tagged with the name of the
+# device whose channel it is, exactly as collect.extractDataPoints tags them.
+NODE_DEVICES = {
+    'Heat Pump': 'Main Panel',
+    'Garage Feed': 'Main Panel',
+    'Garage Lights': 'Garage Subpanel',
+    'A Lights': 'Panel A',
+    'B Lights': 'Panel B',
+}
+
+
 def aggregatePoints(totals, detailed='Hour', accountName='Home', timestamp=HOUR_TS):
     """One reading per node, all at the same instant, as a settled rollup would be."""
-    return [Point(accountName, name, name, watts, timestamp, detailed) for name, watts in totals.items()]
+    return [Point(accountName, NODE_DEVICES.get(name, name), name, watts, timestamp, detailed)
+            for name, watts in totals.items()]
 
 
 HOME_TOTALS = {
@@ -328,6 +341,20 @@ def test_missing_child_contributes_zero():
     assert balancesByNode(points)['Garage Feed'].usageWatts == 3000.0
 
 
+def test_same_channel_name_on_another_device_does_not_clobber_a_total():
+    """Readings are indexed by (device, channel), so a same-named channel elsewhere
+    in the account cannot overwrite a node's total and skew its balance."""
+    config = buildValidatedConfig()
+    points = aggregatePoints(HOME_TOTALS)
+    # Another panel, outside the tree, that also calls one of its circuits 'Garage Feed'.
+    points.append(Point('Home', 'Shop Panel', 'Garage Feed', 99999.0, HOUR_TS, 'Hour'))
+    hierarchy.applyBalances(config, points)
+    balances = balancesByNode(points)
+
+    assert balances['Garage Feed'].usageWatts == 200.0     # 3000 - 2800, as if the other panel did not exist
+    assert balances['Main Panel'].usageWatts == 1000.0     # 10000 - (2000 + 3000 + 4000)
+
+
 def test_node_without_its_own_total_is_skipped():
     config = buildValidatedConfig()
     totals = dict(HOME_TOTALS)
@@ -542,6 +569,22 @@ def test_implicit_edge_that_would_create_a_cycle_is_refused(caplog):
     assert nodes['Main Panel']['parent'] is None
     assert len([r for r in caplog.records if r.levelname == 'WARNING']) == 1
     assert 'would create a cycle' in caplog.text
+
+
+def test_implicit_edge_re_parents_a_parentless_node_without_raising():
+    """A validated tree has one parentless node and re-parenting it is refused as a
+    cycle, so this only bites a tree that lost that invariant -- it must not KeyError
+    in the middle of a collection cycle."""
+    config = buildValidatedConfig(buildDualPanelAccount())
+    nodes = config['hierarchy']['Home']['nodes']
+    # Detach a leaf entirely, leaving a second parentless node behind.
+    nodes['Panel B']['children'].remove('B Lights')
+    nodes['B Lights']['parent'] = None
+
+    hierarchy.registerImplicitEdge(config, 'Home', 'B Lights', 'Panel A')
+
+    assert nodes['B Lights']['parent'] == 'Panel A'
+    assert 'B Lights' in nodes['Panel A']['children']
 
 
 def test_implicit_edge_keeps_the_virtual_rollup_from_double_counting():
