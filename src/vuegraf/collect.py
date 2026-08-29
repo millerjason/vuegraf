@@ -374,7 +374,7 @@ def writeHistoryBatchCsv(csvPath, points: list[Point], mirroredKeys=frozenset())
 
 
 def fetchHistoryRange(config, account, usages, rangeStartUTC, rangeEndUTC, csvPath, usageDataPoints, pauseEvent,
-                      mirroredKeys=frozenset()):
+                      mirroredSinceUTC=None):
     """Fetch history from the Emporia API for a single [start, stop] range.
 
     Batches the range into <=20-day increments, persisting each batch to the CSV
@@ -396,6 +396,7 @@ def fetchHistoryRange(config, account, usages, rangeStartUTC, rangeEndUTC, csvPa
     lastCompletedStopUTC = rangeStartUTC
     aborted = False
     batchCounter = 0
+    mirroredKeys = frozenset()
     while True:
         # Anchor the 20-day windows at rangeStartUTC and clamp the stop to rangeEndUTC.
         incrementStartTimeUTC, incrementEndTimeUTC = calculateHistoryTimeRange(config, rangeEndUTC, rangeStartUTC,
@@ -405,6 +406,15 @@ def fetchHistoryRange(config, account, usages, rangeStartUTC, rangeEndUTC, csvPa
 
         logger.info('History batch {}/{}; start={}; stop={}'.format(
                     batchCounter + 1, totalBatches, incrementStartTimeUTC, incrementEndTimeUTC))
+
+        if batchCounter == 0 and mirroredSinceUTC is not None:
+            # Anchor the de-duplication window at the earliest instant actually fetched.
+            # calculateHistoryTimeRange floors each batch to local midnight, so a range
+            # opening mid-day re-fetches that whole day; anchoring on the coverage end
+            # would leave the already-mirrored hours before it unguarded and append a
+            # second copy of them on every run. Loaded once here, not per batch: later
+            # batches only move forward, into hours no rollup has written yet.
+            mirroredKeys = loadMirroredKeys(config, account, min(mirroredSinceUTC, incrementStartTimeUTC))
         for gid, device in usages.items():
             extractDataPoints(config, account, device, rangeEndUTC, False, usageDataPoints, None,
                               'History', incrementStartTimeUTC, incrementEndTimeUTC)
@@ -503,13 +513,13 @@ def collectHistoryUsage(config, account, startTimeUTC, stopTimeUTC, usageDataPoi
     if covStartUTC is not None and covEndUTC is not None:
         coveredPieces.append((covStartUTC, covEndUTC))
 
-    # Readings the daemon already mirrored into the shared file, so the batches
-    # below do not append a second copy of them.
-    mirroredKeys = loadMirroredKeys(config, account, covEndUTC) if cacheEnabled else frozenset()
+    # Coverage end in effect before this backfill; fetchHistoryRange uses it to skip
+    # re-appending readings the running daemon already mirrored into the shared file.
+    mirroredSinceUTC = covEndUTC if cacheEnabled else None
 
     for gapStartUTC, gapEndUTC in gaps:
         _, dataMinUTC, lastStopUTC, aborted = fetchHistoryRange(
-            config, account, usages, gapStartUTC, gapEndUTC, csvPath, usageDataPoints, pauseEvent, mirroredKeys)
+            config, account, usages, gapStartUTC, gapEndUTC, csvPath, usageDataPoints, pauseEvent, mirroredSinceUTC)
         if dataMinUTC is not None and (earliestDataUTC is None or dataMinUTC < earliestDataUTC):
             earliestDataUTC = dataMinUTC
         # Only claim coverage for what actually completed (matters if aborted mid-gap).

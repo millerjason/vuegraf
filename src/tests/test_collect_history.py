@@ -227,6 +227,32 @@ class TestCollectHistoryUsageCache(TestCase):
         self.assertEqual(rows[1][3], '41.0')  # the row the daemon already wrote
         self.mock_wip_collect.assert_called()  # still written to InfluxDB
 
+    def test_backfill_does_not_re_append_earlier_hours_of_the_day_it_refetches(self):
+        # Coverage ends mid-day, so the uncovered gap is only the last few minutes --
+        # but calculateHistoryTimeRange floors the batch to local midnight, and the API
+        # returns the whole day. The earlier hours of that day were already mirrored by
+        # the daemon, and must not be appended a second time just because they sit
+        # before the coverage end. Regression: every --historydays re-run grew the file.
+        start = _t(2023, 1, 1)
+        mirrored = _t(2023, 1, 20, 9)       # rollup wrote this hour earlier today
+        covEnd = datetime.datetime(2023, 1, 20, 13, 40, tzinfo=UTC)
+        stop = datetime.datetime(2023, 1, 20, 13, 47, tzinfo=UTC)
+        cache.saveManifest(self.config, self.account, start, covEnd, start)
+        cache.writeRollupPoints(self.config, self.account, [Point('Acct', 'Dev', 'Ch', 41.0, mirrored, 'Hour')])
+
+        # The gap is [covEnd, stop], but the batch the API is actually asked for starts
+        # at midnight and so re-delivers the 09:00 reading.
+        self._oneWindow(_t(2023, 1, 20), stop)
+        self._appendPoint(mirrored)
+
+        collect.collectHistoryUsage(self.config, self.account, start, stop, self.points, self.pause)
+
+        with open(cache.getCacheCsvPath(self.config, self.account), newline='') as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(len(rows), 2)        # header + the single mirrored row
+        self.assertEqual(rows[1][3], '41.0')  # the daemon's row, not a re-appended copy
+        self.mock_wip_collect.assert_called()  # still written to InfluxDB
+
     def test_backfill_appends_readings_the_daemon_missed(self):
         # Same overlap window, but the daemon was down for this hour, so nothing was
         # mirrored. The backfill must still write it -- this is the case a coarse
