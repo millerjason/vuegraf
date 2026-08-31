@@ -35,6 +35,7 @@ class TestCollectHistoryUsageCache(TestCase):
         self.account = {'name': 'Acct', 'deviceIdMap': {123: 'Dev'}, 'vue': MagicMock()}
         self.account['vue'].get_device_list_usage.return_value = {123: MagicMock()}
         self.config = {'args': Namespace(skiprestore=False), 'csvCacheEnabled': True,
+                       'influxDb': {}, 'timezone': None,
                        'clampNegativeUsage': False, 'csvCacheDir': 'backfill'}
         self.pause = MagicMock()
         self.pause.wait.return_value = False
@@ -253,6 +254,65 @@ class TestCollectHistoryUsageCache(TestCase):
         self.assertEqual(rows[1][3], '41.0')  # the daemon's row, not a re-appended copy
         self.mock_wip_collect.assert_called()  # still written to InfluxDB
 
+    def test_backfill_does_not_re_append_a_reading_older_than_the_batch_start(self):
+        # The Day tier timestamps itself from Emporia's own bucket start rather than from
+        # the start we asked for, so a batch can return a point OLDER than its start --
+        # typically the previous day's summary. Anchoring the de-duplication window on the
+        # batch start would leave that point unguarded and re-append it on every run.
+        start = _t(2023, 1, 1)
+        covEnd = datetime.datetime(2023, 1, 20, 13, 40, tzinfo=UTC)
+        stop = datetime.datetime(2023, 1, 20, 13, 47, tzinfo=UTC)
+        # Yesterday's daily summary, already mirrored by the daemon at the day rollover.
+        priorDay = datetime.datetime(2023, 1, 19, 23, 59, 59, tzinfo=UTC)
+        cache.saveManifest(self.config, self.account, start, covEnd, start)
+        cache.writeRollupPoints(self.config, self.account, [Point('Acct', 'Dev', 'Ch', 41.0, priorDay, 'Day')])
+
+        # The batch starts at midnight on the 20th, yet hands back a point stamped before it.
+        self._oneWindow(_t(2023, 1, 20), stop)
+
+        def _se(config, account, device, rangeEnd, collectDetails, usageDataPoints,
+                detailedStart, pointType, histStart, histEnd):
+            usageDataPoints.append(Point('Acct', 'Dev', 'Ch', 41.0, priorDay, 'Day'))
+        self.mock_extract.side_effect = _se
+
+        collect.collectHistoryUsage(self.config, self.account, start, stop, self.points, self.pause)
+
+        with open(cache.getCacheCsvPath(self.config, self.account), newline='') as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(len(rows), 2)        # header + the single mirrored row
+        self.assertEqual(rows[1][4], priorDay.isoformat())
+        self.mock_wip_collect.assert_called()  # still written to InfluxDB
+
+    def test_head_gap_does_not_load_the_whole_file_into_the_key_set(self):
+        # A gap reaching back BEFORE the current coverage anchors on its own old start.
+        # Pairing that with an open-ended window would pull every later row in the file
+        # into memory to guard a gap whose rows are almost all absent from it. The
+        # window must stop near the gap's end.
+        covStart, covEnd = _t(2023, 6, 1), _t(2023, 7, 1)
+        cache.saveManifest(self.config, self.account, covStart, covEnd, covStart)
+        # A row deep inside coverage, far past the head gap: must NOT be pulled in.
+        farFuture = _t(2023, 6, 20)
+        cache.writeRollupPoints(self.config, self.account, [Point('Acct', 'Dev', 'Ch', 41.0, farFuture, 'Hour')])
+
+        # Request reaches back to January, so the head gap is [Jan 1, Jun 1].
+        reqStart, gapEnd = _t(2023, 1, 1), covStart
+        self.mock_calc.side_effect = [(reqStart, gapEnd), (gapEnd, gapEnd),
+                                      (covEnd, covEnd)]  # tail gap immediately completes
+        self._appendPoint(reqStart)
+
+        with patch('vuegraf.collect.loadMirroredKeys', wraps=cache.loadMirroredKeys) as spy:
+            collect.collectHistoryUsage(self.config, self.account, reqStart, covEnd, self.points, self.pause)
+
+        spy.assert_called()
+        sinceUTC, untilUTC = spy.call_args[0][2], spy.call_args[0][3]
+        self.assertEqual(sinceUTC, reqStart)              # anchored on the batch's own data
+        self.assertIsNotNone(untilUTC)                    # and bounded above
+        self.assertLess(untilUTC, farFuture)              # so the far row is outside the window
+
+        # The window really does exclude it, rather than merely being narrower on paper.
+        keys = cache.loadMirroredKeys(self.config, self.account, sinceUTC, untilUTC)
+        self.assertNotIn(('Dev', 'Ch', farFuture.isoformat(), 'Hour'), keys)
+
     def test_backfill_appends_readings_the_daemon_missed(self):
         # Same overlap window, but the daemon was down for this hour, so nothing was
         # mirrored. The backfill must still write it -- this is the case a coarse
@@ -350,6 +410,7 @@ class TestCollectHistoryUsageHierarchy(TestCase):
         self.account['vue'].get_device_list_usage.return_value = {123: MagicMock()}
         self.config = {
             'args': Namespace(skiprestore=False),
+            'timezone': None,
             'csvCacheEnabled': True,
             'clampNegativeUsage': False,
             'csvCacheDir': 'backfill',

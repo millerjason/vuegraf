@@ -27,14 +27,17 @@
 # Coverage is tracked as absolute UTC instants, not batch offsets, so it remains
 # correct when the requested --historydays range changes between runs.
 #
-# Because both paths append to one file, a backfill covering a period the daemon
-# already mirrored would write those points twice. loadMirroredKeys() prevents
-# that at the source: before fetching, the keys already present at or after the
-# current coverage end are read back, and matching points are simply not
-# re-appended. That window is bounded by design -- rollups only ever write
-# near-now points, and anything older came from a backfill, which the coverage
-# calculation already excludes -- so the key set stays small no matter how much
-# history the file holds.
+# Because both paths append to one file, a backfill covering a period the file
+# already holds would write those points twice. loadMirroredKeys() prevents that
+# at the source: the keys already present across the span a batch can produce are
+# read back, and matching points are simply not re-appended.
+#
+# That span is wider than the range asked for, in both directions. The API start
+# is floored to local midnight, so a gap opening mid-day re-fetches the whole day;
+# and the Day tier stamps its point at the end of the local day, which can fall
+# either side of the requested bounds. The window is therefore taken from the
+# earliest reading a batch actually returned through to the requested stop plus a
+# margin, rather than from any predicted boundary.
 
 import csv
 import datetime
@@ -44,7 +47,7 @@ import os
 import re
 
 from vuegraf.config import getConfigValue
-from vuegraf.destination import writeDataPoints
+from vuegraf.destination import getTags, writeDataPoints
 
 
 logger = logging.getLogger('vuegraf.cache')
@@ -116,18 +119,69 @@ def writeCsvPoints(csvPath, points):
                              pt.timestamp.isoformat(), pt.detailed])
 
 
+def isSettledPoint(config, point, nowUTC):
+    """True when the aggregation period behind a point has already closed.
+
+    An open period's average is provisional, and whoever collects it after the period
+    closes writes the final figure under the same key. A time-series database absorbs
+    that as an overwrite, but the CSV is append-only, so mirroring a provisional value guarantees
+    a second row for it later. Only closed periods are cached, which is what keeps the
+    file's keys unique.
+
+    Hourly points are stamped at the start of their hour, daily points at the end
+    of their local day (see extractDataPoints). Tiers other than those two are
+    never mirrored, so anything else is treated as settled rather than dropped.
+    """
+    _, _, _, tagValue_hour, tagValue_day = getTags(config)
+    detailed = str(point.detailed)
+    if detailed == str(tagValue_hour):
+        return point.timestamp + datetime.timedelta(hours=1) <= nowUTC
+    if detailed == str(tagValue_day):
+        return point.timestamp <= nowUTC
+    return True
+
+
+def mirrorPoints(config, account, points, mirroredKeys=frozenset(), nowUTC=None):
+    """The single way a point reaches the CSV mirror. Returns the number written.
+
+    Both collection paths funnel through here so one rule decides what gets cached:
+    the period must have closed (isSettledPoint), and the reading must not already
+    be in the file (mirroredKeys, supplied by the backfill for the span it re-reads).
+    """
+    if not isCacheEnabled(config) or not points:
+        return 0
+    if nowUTC is None:
+        nowUTC = datetime.datetime.now(datetime.UTC)
+
+    fresh = []
+    unsettled = 0
+    for pt in points:
+        if not isSettledPoint(config, pt, nowUTC):
+            unsettled += 1
+            continue
+        if pointKey(pt) in mirroredKeys:
+            continue
+        fresh.append(pt)
+
+    if unsettled:
+        logger.debug('Skipped {} unsettled points; their period is still open and will be '
+                     'mirrored once it closes'.format(unsettled))
+    if not fresh:
+        return 0
+
+    csvPath = getCacheCsvPath(config, account)
+    writeCsvPoints(csvPath, fresh)
+    logger.debug('Mirrored {} points to CSV cache; csv={}'.format(len(fresh), csvPath))
+    return len(fresh)
+
+
 def writeRollupPoints(config, account, points):
     """Mirror freshly collected hourly/daily rollup points into the CSV cache.
 
     Called from the normal collection loop so the CSV copy stays as current as
     the database. Returns the number of points written.
     """
-    if not isCacheEnabled(config) or not points:
-        return 0
-    csvPath = getCacheCsvPath(config, account)
-    writeCsvPoints(csvPath, points)
-    logger.debug('Mirrored {} rollup points to CSV cache; csv={}'.format(len(points), csvPath))
-    return len(points)
+    return mirrorPoints(config, account, points)
 
 
 def pointKey(point):
@@ -135,16 +189,24 @@ def pointKey(point):
     return (point.deviceName, point.chanName, point.timestamp.isoformat(), str(point.detailed))
 
 
-def loadMirroredKeys(config, account, sinceUTC):
-    """Keys of points already in the CSV at or after sinceUTC.
+def loadMirroredKeys(config, account, sinceUTC, untilUTC=None):
+    """Keys of points already in the CSV within [sinceUTC, untilUTC].
 
-    Used to keep a backfill from re-appending readings the running daemon has
-    already mirrored. sinceUTC should be the coverage end in effect before the
-    backfill: rollups only ever write near-now points, and anything older came
-    from an earlier backfill, which the gap calculation already excludes. That
-    bounds this to the rollup era rather than the whole file.
+    Used to keep a backfill from re-appending readings that are already in the
+    shared file, whether the running daemon mirrored them or an earlier backfill
+    wrote them. The caller passes the span its batches can actually produce, so
+    the set covers exactly the readings that could be duplicated.
 
-    Returns an empty set when there is no coverage yet or no file, since neither
+    untilUTC matters as much as sinceUTC: without it, a backfill reaching further
+    back than the current coverage ('head' gap) anchors on its own old start and
+    pulls every later row in the file into memory, for a gap whose rows are nearly
+    all absent from the file anyway.
+
+    Both bounds are compared as strings. Every timestamp written by writeCsvPoints
+    is a UTC-offset isoformat, and those sort lexicographically; a row carrying a
+    different offset would compare wrongly, which is why nothing writes one.
+
+    Returns an empty set when there is no lower bound or no file, since neither
     case can contain an overlap.
     """
     csvPath = getCacheCsvPath(config, account)
@@ -152,6 +214,7 @@ def loadMirroredKeys(config, account, sinceUTC):
         return set()
 
     since = sinceUTC.isoformat()
+    until = untilUTC.isoformat() if untilUTC is not None else None
     keys = set()
     with open(csvPath, newline='') as f:
         reader = csv.reader(f)
@@ -159,9 +222,9 @@ def loadMirroredKeys(config, account, sinceUTC):
         for row in reader:
             if len(row) < 6:
                 continue
-            if row[4] >= since:  # ISO-8601 UTC sorts lexicographically
+            if row[4] >= since and (until is None or row[4] <= until):
                 keys.add((row[1], row[2], row[4], row[5]))
-    logger.info('Loaded {} already-mirrored CSV keys at or after {}'.format(len(keys), since))
+    logger.info('Loaded {} already-mirrored CSV keys in {}..{}'.format(len(keys), since, until))
     return keys
 
 
