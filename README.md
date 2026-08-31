@@ -132,6 +132,8 @@ csvCacheDir: backfill
 - `csvCacheEnabled` (default value is `false`): write and read the CSV cache.
 - `csvCacheDir` (default value is `backfill`): directory the CSV files are written to. A relative path is resolved against the working directory; an absolute path is used as-is. The directory is created if it does not exist.
 
+Only **settled** readings are mirrored. An open period's average is provisional: Emporia keeps refining it until the period closes, and whoever collects it afterwards writes the final figure under the same key. InfluxDB absorbs that as an overwrite; an append-only CSV would keep both rows. So the current hour and the current day are held back until they close, and the claimed cache coverage stops at the same boundary, which is what lets the settled value be collected on a later run.
+
 Each account has exactly one data file, named after the account with spaces replaced by underscores — the account named `Primary Residence` writes `Primary_Residence.csv`. It is appended to by both collection paths:
 
 - historical backfill, one append per fetched batch, and
@@ -183,6 +185,10 @@ The cache is purely additive, so it can be turned on at any time — but it only
 > **Series names are the cache's identity.** A reading is keyed by its device and channel name, so renaming a channel makes the new name a *different* series: history keeps accumulating under the old name and the new one starts empty, in the CSV and in InfluxDB alike. This is longstanding Vuegraf behaviour rather than anything the cache introduces, but the cache makes it durable. Settle your `devices[].channels` names (see [Channel Names](#channel-names)) before collecting history you care about.
 >
 > The same applies to the *absence* of a name map: with no `channels` entry for a device, Vuegraf falls back to naming circuits `<Device>-<channelNum>`. Adding descriptive names later renames every one of those series at that instant.
+
+> **Nesting a device changes what its parent's series means.** Emporia deducts a nested device's usage from the channel it sits under, and Vuegraf restores it so a reading means the same thing whoever collected it. Nest a plug under a circuit — or move it — and every reading of that parent from then on measures something different from the ones before it. The cache faithfully records both, so the file spans two definitions with a step at the moment you changed it.
+>
+> Emporia's history API answers as-was: re-fetching an old range returns what was true then, not what today's tree would imply. So a hierarchy change cannot be repaired by re-running `--historydays`, and Vuegraf does not try — reconciling two measurement definitions needs judgement about which one you want, not code. If you change nesting and want one consistent lens over the whole archive, start the cache clean. Otherwise, note the date you changed it.
 
 ### Channel Names
 
@@ -353,6 +359,15 @@ The four balances plus the six leaves total exactly 4000 W — the main panel re
 ```
 
 Naively summing the ten raw series instead gives 8600 W, because the subpanel, its feed, and the plugs are each counted at two or three levels.
+
+##### What the raw series already contain
+
+Worth knowing before writing your own queries, because Emporia's API and its mobile app do not present a circuit the same way:
+
+- **A circuit's reading already includes any plug nested under it.** The API does not deduct there, so a plug's energy is counted twice if you add the plug's own series to its parent circuit's. Note that the Emporia mobile app *does* deduct at the circuit, so the same circuit reads higher through the API than it does in the app.
+- **A device's mains is deducted**, and Vuegraf adds the nested device back so the value means the whole panel. That asymmetry is Emporia's, not Vuegraf's; the add-back exists so a mains reading and a circuit reading can be interpreted the same way.
+
+Vuegraf writes the raw series through untouched, so **any total you build by adding series yourself has to exclude a nested device once it is already inside its parent**. That is exactly the bookkeeping `Net Balance` removes: sum the balances plus the leaves and every reading is counted once, whatever is nested where.
 
 If your service has more than one top-level panel (dual mains), Vuegraf synthesizes a virtual root named `<account> Panel` and writes the sum of those panels under that name, giving you a single correct whole-account total. Emporia has no way to express a root above independent mains.
 

@@ -73,7 +73,8 @@ class TestCacheFilesystem(TestCase):
         self._cwd = os.getcwd()
         os.chdir(self.tmp)
         self.account = {'name': 'Test Acct'}
-        self.config = {'csvCacheEnabled': True, 'csvCacheDir': 'backfill', 'args': None}
+        self.config = {'influxDb': {}, 'timezone': None,
+                       'csvCacheEnabled': True, 'csvCacheDir': 'backfill', 'args': None}
 
     def tearDown(self):
         os.chdir(self._cwd)
@@ -256,7 +257,8 @@ class TestRollupMirror(TestCase):
         self._cwd = os.getcwd()
         os.chdir(self.tmp)
         self.account = {'name': 'Test Acct'}
-        self.config = {'csvCacheEnabled': True, 'csvCacheDir': 'backfill'}
+        self.config = {'influxDb': {}, 'timezone': None,
+                       'csvCacheEnabled': True, 'csvCacheDir': 'backfill'}
 
     def tearDown(self):
         os.chdir(self._cwd)
@@ -303,7 +305,8 @@ class TestMirroredKeys(TestCase):
         self._cwd = os.getcwd()
         os.chdir(self.tmp)
         self.account = {'name': 'Test Acct'}
-        self.config = {'csvCacheEnabled': True, 'csvCacheDir': 'backfill'}
+        self.config = {'influxDb': {}, 'timezone': None,
+                       'csvCacheEnabled': True, 'csvCacheDir': 'backfill'}
 
     def tearDown(self):
         os.chdir(self._cwd)
@@ -355,3 +358,73 @@ class TestMirroredKeys(TestCase):
         cache.writeRollupPoints(self.config, self.account, [Point('Test Acct', 'Dev', 'Ch', 100.0, ts, 'Hour')])
         keys = cache.loadMirroredKeys(self.config, self.account, _t(2026, 8, 1))
         self.assertIn(cache.pointKey(Point('Test Acct', 'Dev', 'Ch', 111.0, ts, 'Hour')), keys)
+
+
+class TestSettledOnlyMirroring(TestCase):
+    """Only closed periods reach the CSV.
+
+    An open period's average is provisional; whoever collects it after it closes
+    writes the final figure under the same key. InfluxDB absorbs that as an
+    overwrite, but the append-only CSV would keep both rows.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._cwd = os.getcwd()
+        os.chdir(self.tmp)
+        self.account = {'name': 'Test Acct'}
+        self.config = {'influxDb': {}, 'timezone': None,
+                       'csvCacheEnabled': True, 'csvCacheDir': 'backfill'}
+
+    def tearDown(self):
+        os.chdir(self._cwd)
+
+    def _rows(self):
+        with open(cache.getCacheCsvPath(self.config, self.account), newline='') as f:
+            return list(csv.reader(f))[1:]
+
+    def test_open_hour_is_held_back_until_it_closes(self):
+        now = datetime.datetime(2026, 8, 29, 16, 47, tzinfo=UTC)
+        openHour = _t(2026, 8, 29, 16)      # closes at 17:00, after 'now'
+        closedHour = _t(2026, 8, 29, 15)    # closed at 16:00
+        written = cache.mirrorPoints(self.config, self.account, [
+            Point('Test Acct', 'Dev', 'Ch', 1.0, openHour, 'Hour'),
+            Point('Test Acct', 'Dev', 'Ch', 2.0, closedHour, 'Hour'),
+        ], nowUTC=now)
+        self.assertEqual(written, 1)
+        self.assertEqual([r[4] for r in self._rows()], [closedHour.isoformat()])
+
+    def test_open_day_is_held_back_until_it_closes(self):
+        # Day points are stamped at the END of their local day, so a stamp in the
+        # future means the day is still accumulating.
+        now = datetime.datetime(2026, 8, 29, 16, 47, tzinfo=UTC)
+        openDay = datetime.datetime(2026, 8, 30, 3, 59, tzinfo=UTC)     # local day 08-29, still open
+        closedDay = datetime.datetime(2026, 8, 29, 3, 59, tzinfo=UTC)   # local day 08-28, closed
+        written = cache.mirrorPoints(self.config, self.account, [
+            Point('Test Acct', 'Dev', 'Ch', 1.0, openDay, 'Day'),
+            Point('Test Acct', 'Dev', 'Ch', 2.0, closedDay, 'Day'),
+        ], nowUTC=now)
+        self.assertEqual(written, 1)
+        self.assertEqual([r[4] for r in self._rows()], [closedDay.isoformat()])
+
+    def test_the_provisional_then_settled_sequence_yields_one_row(self):
+        # The exact production sequence: a backfill mid-day, then the daemon's
+        # rollover write for the same day. Previously two rows; now one.
+        openDay = datetime.datetime(2026, 8, 30, 3, 59, tzinfo=UTC)
+        cache.mirrorPoints(self.config, self.account,
+                           [Point('Test Acct', 'Dev', 'Ch', 111.0, openDay, 'Day')],
+                           nowUTC=datetime.datetime(2026, 8, 29, 16, 47, tzinfo=UTC))      # backfill, day still open
+        cache.mirrorPoints(self.config, self.account,
+                           [Point('Test Acct', 'Dev', 'Ch', 222.0, openDay, 'Day')],
+                           nowUTC=datetime.datetime(2026, 8, 30, 4, 1, tzinfo=UTC))        # daemon, after rollover
+        rows = self._rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][3], '222.0')  # the settled value
+
+    def test_a_tier_other_than_hour_or_day_is_never_held_back(self):
+        # Only Hour/Day are mirrored, so an unrecognised tier must pass through
+        # rather than be silently dropped as "unsettled".
+        written = cache.mirrorPoints(self.config, self.account,
+                                     [Point('Test Acct', 'Dev', 'Ch', 1.0, _t(2026, 8, 1, 5), 'Minutes')],
+                                     nowUTC=_t(2026, 8, 1))
+        self.assertEqual(written, 1)

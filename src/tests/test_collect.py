@@ -16,6 +16,7 @@ from vuegraf.collect import Point
 
 # Basic config structure for tests
 MOCK_CONFIG = {  # Basic config structure for tests
+    'timezone': 'UTC',  # top-level, as initConfig leaves it
     'influx': {
         'tags': {
             'second': 'Seconds',
@@ -1191,3 +1192,163 @@ class TestClampNegativeWatts(TestCase):
             config['_negativeUsageWarnExpiry'] = {k: 0.0 for k in config['_negativeUsageWarnExpiry']}
             collect.clampNegativeWatts(config, self._points())
             self.assertEqual(mockLogger.warning.call_count, 2)
+
+
+class TestNestedHistoryAddBack(TestCase):
+    """A backfilled hour must equal a live-collected one for a channel with plugs beneath it.
+
+    Emporia deducts a nested device's usage from the channel feeding it. The live path
+    adds that back so the series has one meaning; get_chart_usage reports the same
+    deducted reading, so the history path has to add it back too.
+    """
+
+    def setUp(self):
+        self.config = {'timezone': 'UTC', 'influxDb': {}}
+        self.account = {'name': 'Acct', 'vue': MagicMock(),
+                        'deviceIdMap': {1: 'Panel'}, 'channelIdMap': {}}
+        self.start = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        self.stop = datetime.datetime(2024, 1, 2, tzinfo=datetime.timezone.utc)
+
+        self.patchers = [
+            patch('vuegraf.collect.getConfigValue', side_effect=lambda c, k: {'detailedDataEnabled': False}.get(k, False)),
+            patch('vuegraf.collect.getInfluxTag', return_value=(None, 'Sec', 'Min', 'Hour', 'Day')),
+            patch('vuegraf.collect.lookupDeviceName', side_effect=lambda a, g: 'Panel' if g == 1 else 'Plug'),
+            patch('vuegraf.collect.lookupChannelName',
+                  side_effect=lambda a, ch: 'Feed Circuit' if ch.device_gid == 1 else 'Plug Mains'),
+            patch('vuegraf.collect.registerImplicitEdge'),
+            patch('vuegraf.collect.convertToLocalDayInUTC', side_effect=lambda c, dt: dt.replace(hour=23, minute=59, second=59)),
+        ]
+        for p in self.patchers:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patchers:
+            p.stop()
+
+    def _chan(self, gid, num, usage, nested=None):
+        chan = MagicMock()
+        chan.device_gid, chan.channel_num, chan.usage = gid, num, usage
+        chan.nested_devices = nested or {}
+        return chan
+
+    def test_history_restores_the_usage_emporia_deducted_for_a_nested_device(self):
+        # The plug's own mains, as get_chart_usage would report it hour by hour.
+        plugChan = self._chan(2, '1,2,3', 0.005)
+        plug = MagicMock()
+        plug.device_gid, plug.channels = 2, {'1,2,3': plugChan}
+        # The feed circuit, reported net of the plug.
+        feed = self._chan(1, '1,2,3', 0.010, nested={2: plug})
+        device = MagicMock()
+        device.device_gid, device.channels = 1, {'1,2,3': feed}
+
+        hourStart = self.start
+
+        def chartUsage(channel, start, end, scale, unit):
+            if scale == Scale.HOUR.value:
+                return ([0.010] if channel is feed else [0.004]), hourStart
+            return ([0.100] if channel is feed else [0.040]), hourStart
+        self.account['vue'].get_chart_usage.side_effect = chartUsage
+
+        points = []
+        collect.extractDataPoints(self.config, self.account, device, self.stop, False, points, None,
+                                  'History', self.start, self.stop)
+
+        hourly = [p for p in points if p.detailed == 'Hour' and p.chanName == 'Feed Circuit']
+        self.assertEqual(len(hourly), 1)
+        # 0.010 raw + 0.004 the plug drew = 0.014 kWh -> 14 W-equivalent
+        self.assertAlmostEqual(hourly[0].usageWatts, 14.0, places=6)
+
+        daily = [p for p in points if p.detailed == 'Day' and p.chanName == 'Feed Circuit']
+        self.assertEqual(len(daily), 1)
+        self.assertAlmostEqual(daily[0].usageWatts, 140.0, places=6)
+
+    def test_a_channel_with_nothing_nested_makes_no_extra_api_calls(self):
+        plain = self._chan(1, '1,2,3', 0.010)
+        device = MagicMock()
+        device.device_gid, device.channels = 1, {'1,2,3': plain}
+        self.account['vue'].get_chart_usage.side_effect = lambda channel, start, end, scale, unit: ([0.010], self.start)
+
+        points = []
+        collect.extractDataPoints(self.config, self.account, device, self.stop, False, points, None,
+                                  'History', self.start, self.stop)
+
+        # Exactly two calls: the channel's own Hour series and its Day series.
+        self.assertEqual(self.account['vue'].get_chart_usage.call_count, 2)
+        hourly = [p for p in points if p.detailed == 'Hour']
+        self.assertAlmostEqual(hourly[0].usageWatts, 10.0, places=6)
+
+    def test_a_gap_in_the_nested_series_leaves_that_bucket_unadjusted(self):
+        # The plug reported nothing for the second hour. That bucket gets the raw
+        # reading rather than a wrong add-back or a crash.
+        plugChan = self._chan(2, '1,2,3', 0.005)
+        plug = MagicMock()
+        plug.device_gid, plug.channels = 2, {'1,2,3': plugChan}
+        feed = self._chan(1, '1,2,3', 0.010, nested={2: plug})
+        device = MagicMock()
+        device.device_gid, device.channels = 1, {'1,2,3': feed}
+
+        def chartUsage(channel, start, end, scale, unit):
+            if scale == Scale.HOUR.value:
+                return ([0.010, 0.010] if channel is feed else [0.004, None]), self.start
+            return ([0.100] if channel is feed else [0.040]), self.start
+        self.account['vue'].get_chart_usage.side_effect = chartUsage
+
+        points = []
+        collect.extractDataPoints(self.config, self.account, device, self.stop, False, points, None,
+                                  'History', self.start, self.stop)
+
+        hourly = sorted([p for p in points if p.detailed == 'Hour' and p.chanName == 'Feed Circuit'],
+                        key=lambda p: p.timestamp)
+        self.assertAlmostEqual(hourly[0].usageWatts, 14.0, places=6)   # 0.010 + 0.004
+        self.assertAlmostEqual(hourly[1].usageWatts, 10.0, places=6)   # raw only
+
+    def test_only_the_nested_device_mains_is_added_back(self):
+        # A nested device's individual circuits are already inside its mains, so
+        # counting them too would inflate the parent.
+        mains = self._chan(2, '1,2,3', 0.005)
+        branch = self._chan(2, '1', 0.003)
+        plug = MagicMock()
+        plug.device_gid, plug.channels = 2, {'1,2,3': mains, '1': branch}
+        feed = self._chan(1, '1,2,3', 0.010, nested={2: plug})
+        device = MagicMock()
+        device.device_gid, device.channels = 1, {'1,2,3': feed}
+
+        def chartUsage(channel, start, end, scale, unit):
+            if scale == Scale.HOUR.value:
+                return ([0.010] if channel is feed else [0.004]), self.start
+            return ([0.100] if channel is feed else [0.040]), self.start
+        self.account['vue'].get_chart_usage.side_effect = chartUsage
+
+        points = []
+        collect.extractDataPoints(self.config, self.account, device, self.stop, False, points, None,
+                                  'History', self.start, self.stop)
+
+        hourly = [p for p in points if p.detailed == 'Hour' and p.chanName == 'Feed Circuit']
+        self.assertAlmostEqual(hourly[0].usageWatts, 14.0, places=6)  # mains only, branch ignored
+
+    def test_a_numbered_circuit_gets_no_add_back(self):
+        """get_chart_usage already includes the nested load for a numbered circuit --
+        only a device's mains has it deducted -- so adding it here would double count."""
+        plugChan = self._chan(2, '1,2,3', 0.005)
+        plug = MagicMock()
+        plug.device_gid, plug.channels = 2, {'1,2,3': plugChan}
+        circuit = self._chan(1, '6', 0.010, nested={2: plug})   # numbered, not mains
+        device = MagicMock()
+        device.device_gid, device.channels = 1, {'6': circuit}
+
+        def chartUsage(channel, start, end, scale, unit):
+            if scale == Scale.HOUR.value:
+                return ([0.010] if channel is circuit else [0.004]), self.start
+            return ([0.100] if channel is circuit else [0.040]), self.start
+        self.account['vue'].get_chart_usage.side_effect = chartUsage
+
+        points = []
+        collect.extractDataPoints(self.config, self.account, device, self.stop, False, points, None,
+                                  'History', self.start, self.stop)
+
+        hourly = [p for p in points if p.detailed == 'Hour' and p.chanName == 'Feed Circuit']
+        self.assertAlmostEqual(hourly[0].usageWatts, 10.0, places=6)  # raw, unadjusted
+        # Four calls: the circuit's own Hour+Day, and the plug's own Hour+Day from the
+        # recursion that records it as a series in its own right. An add-back would have
+        # fetched the plug's mains a second time, making six.
+        self.assertEqual(self.account['vue'].get_chart_usage.call_count, 4)

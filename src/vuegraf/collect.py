@@ -18,17 +18,16 @@ from vuegraf.cache import (
     loadManifest,
     loadMirroredKeys,
     mergeCoverage,
-    pointKey,
     restoreCacheToInflux,
     saveManifest,
     subtractCoverage,
-    writeCsvPoints,
+    mirrorPoints,
 )
 from vuegraf.config import getConfigValue, getInfluxTag
 from vuegraf.device import lookupDeviceName, lookupChannelName
 from vuegraf.hierarchy import applyBalances, registerImplicitEdge
 from vuegraf.influx import getLastDBTimeStamp, writeInfluxPoints
-from vuegraf.time import calculateHistoryTimeRange, convertToLocalDayInUTC
+from vuegraf.time import calculateHistoryTimeRange, convertToLocalDayInUTC, getLocalDayStartUTC
 
 
 logger = logging.getLogger('vuegraf.data')
@@ -41,6 +40,12 @@ MINUTE_BACKFILL_SKIP_TTL_SEC = 3600  # 1 hour
 # How long to stay quiet about a series that keeps reporting a negative reading. Like a
 # negative net balance, a mis-scaled channel is a standing condition, not a transient one.
 NEGATIVE_USAGE_WARN_TTL_SEC = 3600  # 1 hour
+
+# How far past a requested stop a batch's points can still land, used to bound the
+# de-duplication window in fetchHistoryRange. The Day tier stamps its point at the end of
+# the local day, so it can sit up to a day plus the UTC offset after the stop; two days
+# clears that for every timezone.
+MIRRORED_KEY_MARGIN = datetime.timedelta(days=2)
 
 
 def getMinuteBackfillSkipCache(config):
@@ -137,6 +142,53 @@ def nestedDeviceUsage(nestedDevice):
         if chanNum == '1,2,3' and chan.usage is not None:
             total += chan.usage
     return total
+
+
+def historySeriesByTimestamp(config, account, channel, startUTC, endUTC, scale):
+    """{timestamp: kwh} for one channel over a history window.
+
+    Timestamps are derived exactly as extractDataPoints stamps its own history points,
+    so a caller can combine two channels' series by timestamp rather than by index --
+    the two need not start at the same bucket, and a None reading leaves a hole.
+    """
+    usage, startedUTC = account['vue'].get_chart_usage(channel, startUTC, endUTC, scale=scale, unit=Unit.KWH.value)
+    series = {}
+    if scale == Scale.HOUR.value:
+        startedUTC = startedUTC.replace(minute=0, second=0, microsecond=0)
+    for index, kwhUsage in enumerate(usage or []):
+        if kwhUsage is None:
+            continue
+        if scale == Scale.HOUR.value:
+            timestamp = startedUTC + datetime.timedelta(hours=index)
+        else:
+            timestamp = convertToLocalDayInUTC(config, startedUTC + datetime.timedelta(hours=6, days=index))
+        series[timestamp] = kwhUsage
+    return series
+
+
+def nestedHistoryTotals(config, account, chan, startUTC, endUTC, scale):
+    """Per-bucket total of the mains of every device nested under this channel.
+
+    Emporia deducts a nested device's usage from the reading of whatever it hangs
+    beneath, and the live path adds it back (see nestedDeviceUsage) so a series means
+    the same thing whoever collected it. get_chart_usage needs the same treatment, but
+    only for a device's mains ('1,2,3'): its numbered circuits already include the
+    nested load, so adding it there too would double count. That asymmetry is observed
+    behaviour rather than something Emporia documents, which is why it is applied
+    narrowly. Without it a backfilled reading sits below a live one for any panel with
+    a device nested beneath it.
+
+    Returns {} when nothing is nested, which is the common case and costs no API calls.
+    """
+    totals = {}
+    for gid, nestedDevice in (chan.nested_devices or {}).items():
+        for nestedChanNum, nestedChan in nestedDevice.channels.items():
+            if nestedChanNum != '1,2,3':
+                continue
+            for timestamp, kwhUsage in historySeriesByTimestamp(
+                    config, account, nestedChan, startUTC, endUTC, scale).items():
+                totals[timestamp] = totals.get(timestamp, 0.0) + kwhUsage
+    return totals
 
 
 def extractDataPoints(config, account, device, stopTimeUTC, collectDetails, usageDataPoints: list[Point],
@@ -304,13 +356,15 @@ def extractDataPoints(config, account, device, stopTimeUTC, collectDetails, usag
             usage, usageStartTimeUTC = account['vue'].get_chart_usage(chan, historyStartTimeUTC, historyEndTimeUTC,
                                                                       scale=Scale.HOUR.value, unit=Unit.KWH.value)
             usageStartTimeUTC = usageStartTimeUTC.replace(minute=0, second=0, microsecond=0)
+            nestedHourly = (nestedHistoryTotals(config, account, chan, historyStartTimeUTC, historyEndTimeUTC,
+                                                Scale.HOUR.value) if chanNum == '1,2,3' else {})
             index = 0
             for kwhUsage in usage:
                 if kwhUsage is None:
                     index += 1
                     continue
                 timestamp = usageStartTimeUTC + datetime.timedelta(hours=index)
-                watts = kwhUsage * wattsInAKw
+                watts = (kwhUsage + nestedHourly.get(timestamp, 0.0)) * wattsInAKw
                 usageDataPoints.append(Point(accountName, deviceName, chanName,
                                        watts, timestamp, tagValue_hour))
                 index += 1
@@ -318,6 +372,8 @@ def extractDataPoints(config, account, device, stopTimeUTC, collectDetails, usag
             # Collect historical day averages
             usage, usageStartTimeUTC = account['vue'].get_chart_usage(chan, historyStartTimeUTC, historyEndTimeUTC,
                                                                       scale=Scale.DAY.value, unit=Unit.KWH.value)
+            nestedDaily = (nestedHistoryTotals(config, account, chan, historyStartTimeUTC, historyEndTimeUTC,
+                                               Scale.DAY.value) if chanNum == '1,2,3' else {})
             index = 0
             for kwhUsage in usage:
                 if kwhUsage is None:
@@ -329,7 +385,7 @@ def extractDataPoints(config, account, device, stopTimeUTC, collectDetails, usag
                 # usageStartTimeUTC, returned by Emporia, will be midnight as well.
                 timestamp = convertToLocalDayInUTC(config, usageStartTimeUTC + datetime.timedelta(hours=6, days=index))
 
-                watts = kwhUsage * wattsInAKw
+                watts = (kwhUsage + nestedDaily.get(timestamp, 0.0)) * wattsInAKw
                 usageDataPoints.append(Point(accountName, deviceName, chanName, watts, timestamp, tagValue_day))
                 index += 1
 
@@ -359,18 +415,15 @@ def collectUsage(config, account, startTimeUTC, stopTimeUTC, collectDetails, usa
     clampNegativeWatts(config, usageDataPoints, startIndex)
 
 
-def writeHistoryBatchCsv(csvPath, points: list[Point], mirroredKeys=frozenset()):
+def writeHistoryBatchCsv(config, account, points: list[Point], mirroredKeys=frozenset()):
     """Appends a batch of history points to the CSV cache, for recovery/inspection.
 
-    Points already mirrored by the running daemon are skipped, so the shared
-    account file does not accumulate a second copy of them. csvPath is None when
-    the CSV cache is disabled, in which case history goes only to InfluxDB.
+    Delegates to cache.mirrorPoints, the one gate every mirrored point passes
+    through: still-open periods are held back until they settle, and readings the
+    file already holds are not appended again. A no-op when the cache is disabled,
+    in which case history goes only to InfluxDB.
     """
-    if csvPath is None:
-        return
-    fresh = [pt for pt in points if pointKey(pt) not in mirroredKeys]
-    if fresh:
-        writeCsvPoints(csvPath, fresh)
+    mirrorPoints(config, account, points, mirroredKeys)
 
 
 def fetchHistoryRange(config, account, usages, rangeStartUTC, rangeEndUTC, csvPath, usageDataPoints, pauseEvent,
@@ -397,6 +450,7 @@ def fetchHistoryRange(config, account, usages, rangeStartUTC, rangeEndUTC, csvPa
     aborted = False
     batchCounter = 0
     mirroredKeys = frozenset()
+    mirroredKeysLoaded = False
     while True:
         # Anchor the 20-day windows at rangeStartUTC and clamp the stop to rangeEndUTC.
         incrementStartTimeUTC, incrementEndTimeUTC = calculateHistoryTimeRange(config, rangeEndUTC, rangeStartUTC,
@@ -407,14 +461,6 @@ def fetchHistoryRange(config, account, usages, rangeStartUTC, rangeEndUTC, csvPa
         logger.info('History batch {}/{}; start={}; stop={}'.format(
                     batchCounter + 1, totalBatches, incrementStartTimeUTC, incrementEndTimeUTC))
 
-        if batchCounter == 0 and mirroredSinceUTC is not None:
-            # Anchor the de-duplication window at the earliest instant actually fetched.
-            # calculateHistoryTimeRange floors each batch to local midnight, so a range
-            # opening mid-day re-fetches that whole day; anchoring on the coverage end
-            # would leave the already-mirrored hours before it unguarded and append a
-            # second copy of them on every run. Loaded once here, not per batch: later
-            # batches only move forward, into hours no rollup has written yet.
-            mirroredKeys = loadMirroredKeys(config, account, min(mirroredSinceUTC, incrementStartTimeUTC))
         for gid, device in usages.items():
             extractDataPoints(config, account, device, rangeEndUTC, False, usageDataPoints, None,
                               'History', incrementStartTimeUTC, incrementEndTimeUTC)
@@ -431,9 +477,26 @@ def fetchHistoryRange(config, account, usages, rangeStartUTC, rangeEndUTC, csvPa
             if earliestDataUTC is None or batchEarliest < earliestDataUTC:
                 earliestDataUTC = batchEarliest
 
+            if not mirroredKeysLoaded and mirroredSinceUTC is not None:
+                # Lower bound: the earliest instant this batch ACTUALLY returned, not a
+                # predicted boundary. calculateHistoryTimeRange already floors the request
+                # to local midnight, and a returned point can be older still -- the Day
+                # tier timestamps itself from Emporia's own bucket start (see
+                # extractDataPoints), which begins before our start when the account's
+                # timezone differs from the configured one, yielding the PREVIOUS day's
+                # summary. Anchoring on data covers those without predicting them.
+                #
+                # Upper bound: the requested stop plus a margin for that same end-of-local-day
+                # stamping. Without it a 'head' gap -- one reaching back past the current
+                # coverage -- pairs its own old start with an open end and pulls the whole file
+                # into memory to guard rows that lie outside the gap anyway.
+                mirroredKeys = loadMirroredKeys(config, account, min(mirroredSinceUTC, batchEarliest),
+                                                rangeEndUTC + MIRRORED_KEY_MARGIN)
+                mirroredKeysLoaded = True
+
         batchPoints = len(usageDataPoints)
         pointsWritten += batchPoints
-        writeHistoryBatchCsv(csvPath, usageDataPoints, mirroredKeys)
+        writeHistoryBatchCsv(config, account, usageDataPoints, mirroredKeys)
         writeInfluxPoints(config, usageDataPoints)
         del usageDataPoints[:]
         lastCompletedStopUTC = incrementEndTimeUTC
@@ -522,7 +585,12 @@ def collectHistoryUsage(config, account, startTimeUTC, stopTimeUTC, usageDataPoi
             config, account, usages, gapStartUTC, gapEndUTC, csvPath, usageDataPoints, pauseEvent, mirroredSinceUTC)
         if dataMinUTC is not None and (earliestDataUTC is None or dataMinUTC < earliestDataUTC):
             earliestDataUTC = dataMinUTC
-        # Only claim coverage for what actually completed (matters if aborted mid-gap).
+        # Only claim coverage for what actually completed (matters if aborted mid-gap), and
+        # never past the last closed period: the mirror holds open periods back, so claiming
+        # them would mean their final values are never collected. Existing coverage is a
+        # separate piece and is never reduced by this.
+        if cacheEnabled:
+            lastStopUTC = min(lastStopUTC, getLocalDayStartUTC(config, gapEndUTC))
         if lastStopUTC > gapStartUTC:
             coveredPieces.append((gapStartUTC, lastStopUTC))
         if aborted:
