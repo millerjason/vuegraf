@@ -130,6 +130,8 @@ maxHistoryDays: 720
 
 IMPORTANT - If you restart Vuegraf with `--historydays` on the command line (or forget to remove it from the dockerfile) it will import history data _again_. Re-imported points overwrite the existing ones in the database (they share the same timestamp and tags), so this does not create duplicates, but it can be slow and places unnecessary load on the Emporia servers. For best results, only enable `--historydays` on a single run.
 
+> **VictoriaMetrics users: turn on deduplication.** That overwrite is an InfluxDB property. VictoriaMetrics stores a repeated write as an additional sample at the same timestamp, so re-importing history leaves two samples per reading and a query picks between them arbitrarily. The same applies to any reading collected twice — the current hour's average is provisional and is collected again once the hour closes. Run VictoriaMetrics with [`-dedup.minScrapeInterval=1ms`](https://docs.victoriametrics.com/#deduplication), which keeps the last sample written at a given timestamp and restores the overwrite semantics the rest of this document assumes.
+
 For Example:
 ```
 python3 path/to/vuegraf.py vuegraf.json --historydays 365
@@ -185,7 +187,7 @@ When the cache is enabled, the history files act as a local cache in front of th
 - Windows that returned no data (for example, dates before your monitors were installed) are recorded as covered, so they are not re-probed on later runs.
 - This makes long backfills resumable: if a run is interrupted, re-running continues from where the cache left off. Because the coverage is tracked as absolute timestamps, it remains correct even if you change the `--historydays` value between runs.
 
-If the database already contains the cached range and you only want to fetch the newest data, pass `--skiprestore` to skip the CSV-to-database restore step.
+If the database already contains the cached range and you only want to fetch the newest data, pass `--skiprestore` to skip the CSV-to-database restore step. On VictoriaMetrics this is worth doing whenever the restore is redundant, since re-writing a reading adds a sample there rather than replacing one unless deduplication is enabled — see the note under [Configuration](#configuration).
 
 Note that `--historydays` is silently clamped to `maxHistoryDays` (default `720`). If your cache reaches back further than that, raise `maxHistoryDays` too, or the restore stops short without telling you.
 
