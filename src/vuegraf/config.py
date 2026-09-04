@@ -128,7 +128,7 @@ def initArgs():
         )
     parser.add_argument(
         '--skiprestore',
-        help='During history backfill, skip restoring the cached CSV range into InfluxDB '
+        help='During history backfill, skip restoring the cached CSV range into the database '
              '(assume it is already present) and only fetch/true-up the uncovered range',
         action='store_true',
         default=False

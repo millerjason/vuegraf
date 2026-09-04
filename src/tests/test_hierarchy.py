@@ -620,3 +620,34 @@ def test_settle_lag_is_capped_so_it_cannot_starve_the_rollover():
     config = buildValidatedConfig(hierarchyAggregateSettleSecs=99999)
     now = HOUR_TS + datetime.timedelta(seconds=hierarchy.MAX_SETTLE_SECS)
     assert hierarchy.isAggregateSettled(config, HOUR_TS, now) is True
+
+
+def test_balances_are_emitted_on_a_victoria_metrics_only_install():
+    """The balance pass reads its Hour/Day tags from the configured destination.
+
+    Only hourly and daily aggregates are netted, so the pass has to recognise those
+    tags -- which are per-destination settings. On a VictoriaMetrics-only install
+    there is no influxDb section to read them from.
+    """
+    account = buildAccount()
+    config = buildConfig(victoriaMetrics={'url': 'http://vm:8428'})
+    del config['influxDb']
+    validateHierarchy(config, account)
+
+    points = aggregatePoints(HOME_TOTALS)
+    hierarchy.applyBalances(config, points)
+
+    balances = {pt.chanName: pt.usageWatts for pt in points if pt.chanName.endswith('Net Balance')}
+    assert balances['Main Panel Net Balance'] == 1000.0  # 10000 - 2000 - 3000 - 4000
+
+
+def test_a_renamed_victoria_metrics_hour_tag_is_recognised():
+    account = buildAccount()
+    config = buildConfig(victoriaMetrics={'url': 'http://vm:8428', 'tagValue_hour': 'hourly'})
+    del config['influxDb']
+    validateHierarchy(config, account)
+
+    points = aggregatePoints(HOME_TOTALS, detailed='hourly')
+    hierarchy.applyBalances(config, points)
+
+    assert any(pt.chanName == 'Main Panel Net Balance' for pt in points)

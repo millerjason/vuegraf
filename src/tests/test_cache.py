@@ -428,3 +428,42 @@ class TestSettledOnlyMirroring(TestCase):
                                      [Point('Test Acct', 'Dev', 'Ch', 1.0, _t(2026, 8, 1, 5), 'Minutes')],
                                      nowUTC=_t(2026, 8, 1))
         self.assertEqual(written, 1)
+
+
+class TestSettledGateReadsTheConfiguredDestination(TestCase):
+    """The settled-period gate takes its resolution tags from whichever database is configured.
+
+    The gate compares a point's `detailed` tag against the Hour and Day tag values, and
+    those are per-destination settings. Reading them from a fixed influxDb section would
+    raise KeyError on a VictoriaMetrics-only install, and would silently mirror
+    provisional values for anyone who renamed the tags there.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._cwd = os.getcwd()
+        os.chdir(self.tmp)
+        self.account = {'name': 'Test Acct'}
+
+    def tearDown(self):
+        os.chdir(self._cwd)
+
+    def _config(self, **overrides):
+        config = {'timezone': None, 'csvCacheEnabled': True, 'csvCacheDir': 'backfill'}
+        config.update(overrides)
+        return config
+
+    def test_victoria_metrics_only_install_holds_back_an_open_hour(self):
+        config = self._config(victoriaMetrics={'url': 'http://vm:8428'})
+        now = datetime.datetime(2026, 8, 29, 16, 47, tzinfo=UTC)
+        written = cache.mirrorPoints(config, self.account, [
+            Point('Test Acct', 'Dev', 'Ch', 1.0, _t(2026, 8, 29, 16), 'Hour'),   # still open
+            Point('Test Acct', 'Dev', 'Ch', 2.0, _t(2026, 8, 29, 15), 'Hour'),   # closed
+        ], nowUTC=now)
+        self.assertEqual(written, 1)
+
+    def test_renamed_victoria_metrics_tag_values_are_honoured(self):
+        config = self._config(victoriaMetrics={'url': 'http://vm:8428', 'tagValue_hour': 'hourly'})
+        now = datetime.datetime(2026, 8, 29, 16, 47, tzinfo=UTC)
+        openHour = [Point('Test Acct', 'Dev', 'Ch', 1.0, _t(2026, 8, 29, 16), 'hourly')]
+        self.assertEqual(cache.mirrorPoints(config, self.account, openHour, nowUTC=now), 0)

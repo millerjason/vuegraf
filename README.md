@@ -128,7 +128,7 @@ maxHistoryDays: 720
 ```
 
 
-IMPORTANT - If you restart Vuegraf with `--historydays` on the command line (or forget to remove it from the dockerfile) it will import history data _again_. Re-imported points overwrite the existing ones in InfluxDB (they share the same timestamp and tags), so this does not create duplicates, but it can be slow and places unnecessary load on the Emporia servers. For best results, only enable `--historydays` on a single run.
+IMPORTANT - If you restart Vuegraf with `--historydays` on the command line (or forget to remove it from the dockerfile) it will import history data _again_. Re-imported points overwrite the existing ones in the database (they share the same timestamp and tags), so this does not create duplicates, but it can be slow and places unnecessary load on the Emporia servers. For best results, only enable `--historydays` on a single run.
 
 For Example:
 ```
@@ -137,7 +137,7 @@ python3 path/to/vuegraf.py vuegraf.json --historydays 365
 
 ### CSV Cache
 
-Vuegraf can optionally maintain a CSV copy of your data on disk, alongside InfluxDB. This is off by default; enable it with the top-level `csvCacheEnabled` configuration value:
+Vuegraf can optionally maintain a CSV copy of your data on disk, alongside your database. This is off by default; enable it with the top-level `csvCacheEnabled` configuration value:
 
 ```
 csvCacheEnabled: true
@@ -147,16 +147,16 @@ csvCacheDir: backfill
 - `csvCacheEnabled` (default value is `false`): write and read the CSV cache.
 - `csvCacheDir` (default value is `backfill`): directory the CSV files are written to. A relative path is resolved against the working directory; an absolute path is used as-is. The directory is created if it does not exist.
 
-Only **settled** readings are mirrored. An open period's average is provisional: Emporia keeps refining it until the period closes, and whoever collects it afterwards writes the final figure under the same key. InfluxDB absorbs that as an overwrite; an append-only CSV would keep both rows. So the current hour and the current day are held back until they close, and the claimed cache coverage stops at the same boundary, which is what lets the settled value be collected on a later run.
+Only **settled** readings are mirrored. An open period's average is provisional: Emporia keeps refining it until the period closes, and whoever collects it afterwards writes the final figure under the same key. A time series database absorbs that as an overwrite; an append-only CSV would keep both rows. So the current hour and the current day are held back until they close, and the claimed cache coverage stops at the same boundary, which is what lets the settled value be collected on a later run.
 
 Each account has exactly one data file, named after the account with spaces replaced by underscores — the account named `Primary Residence` writes `Primary_Residence.csv`. It is appended to by both collection paths:
 
 - historical backfill, one append per fetched batch, and
-- normal operation, one append per hourly and daily average as it is collected, so the CSV stays as current as InfluxDB.
+- normal operation, one append per hourly and daily average as it is collected, so the CSV stays as current as the database.
 
-Per-minute points are not mirrored: they are orders of magnitude more voluminous and are already durable in InfluxDB.
+Per-minute points are not mirrored: they are orders of magnitude more voluminous and are already durable in the database.
 
-Keeping it to a single file means the CSV is a self-contained, lower-resolution mirror of InfluxDB, ready to load directly without stitching files together:
+Keeping it to a single file means the CSV is a self-contained, lower-resolution mirror of the database, ready to load directly without stitching files together:
 
 ```python
 df = pd.read_csv('backfill/Primary_Residence.csv', parse_dates=['timestamp_utc'])
@@ -181,11 +181,11 @@ Restoring a range from the CSV, and reading back the already-mirrored keys, each
 
 When the cache is enabled, the history files act as a local cache in front of the Emporia history API. A small JSON manifest per account records which time range has already been collected:
 
-- On a subsequent `--historydays` run, any portion of the requested range already recorded in the cache is restored directly from the CSV files into InfluxDB, without calling the Emporia API. Only data newer (or otherwise outside) the cached range is fetched from Emporia to "true-up" the database.
+- On a subsequent `--historydays` run, any portion of the requested range already recorded in the cache is restored directly from the CSV files into every configured database, without calling the Emporia API. Only data newer (or otherwise outside) the cached range is fetched from Emporia to "true-up" the database.
 - Windows that returned no data (for example, dates before your monitors were installed) are recorded as covered, so they are not re-probed on later runs.
 - This makes long backfills resumable: if a run is interrupted, re-running continues from where the cache left off. Because the coverage is tracked as absolute timestamps, it remains correct even if you change the `--historydays` value between runs.
 
-If InfluxDB already contains the cached range and you only want to fetch the newest data, pass `--skiprestore` to skip the CSV-to-InfluxDB restore step.
+If the database already contains the cached range and you only want to fetch the newest data, pass `--skiprestore` to skip the CSV-to-database restore step.
 
 Note that `--historydays` is silently clamped to `maxHistoryDays` (default `720`). If your cache reaches back further than that, raise `maxHistoryDays` too, or the restore stops short without telling you.
 
@@ -193,11 +193,11 @@ Note that `--historydays` is silently clamped to `maxHistoryDays` (default `720`
 
 The cache is purely additive, so it can be turned on at any time — but it only mirrors what Vuegraf collects *from that point on*.
 
-- **New installation.** Enable `csvCacheEnabled` before your first run. Every hourly and daily point is then mirrored as it is collected, and the CSV grows into a complete record alongside InfluxDB.
-- **Existing installation.** Turning the setting on starts an empty CSV; it does not export the history already sitting in InfluxDB. To seed the cache from Emporia, run once with `--historydays` covering the range you want. That populates both the CSV and InfluxDB, and re-written points overwrite the existing InfluxDB points rather than duplicating them.
+- **New installation.** Enable `csvCacheEnabled` before your first run. Every hourly and daily point is then mirrored as it is collected, and the CSV grows into a complete record alongside the database.
+- **Existing installation.** Turning the setting on starts an empty CSV; it does not export the history already sitting in the database. To seed the cache from Emporia, run once with `--historydays` covering the range you want. That populates both the CSV and the database, and re-written points overwrite the existing ones rather than duplicating them.
 - **Existing CSV, missing manifest.** If the manifest is deleted but the CSV survives, coverage is bootstrapped by scanning the CSV once on the next run. That scan sees only the first and last timestamps, so it cannot detect interior gaps; delete both files to force a complete re-probe.
 
-> **Series names are the cache's identity.** A reading is keyed by its device and channel name, so renaming a channel makes the new name a *different* series: history keeps accumulating under the old name and the new one starts empty, in the CSV and in InfluxDB alike. This is longstanding Vuegraf behaviour rather than anything the cache introduces, but the cache makes it durable. Settle your `devices[].channels` names (see [Channel Names](#channel-names)) before collecting history you care about.
+> **Series names are the cache's identity.** A reading is keyed by its device and channel name, so renaming a channel makes the new name a *different* series: history keeps accumulating under the old name and the new one starts empty, in the CSV and in the database alike. This is longstanding Vuegraf behaviour rather than anything the cache introduces, but the cache makes it durable. Settle your `devices[].channels` names (see [Channel Names](#channel-names)) before collecting history you care about.
 >
 > The same applies to the *absence* of a name map: with no `channels` entry for a device, Vuegraf falls back to naming circuits `<Device>-<channelNum>`. Adding descriptive names later renames every one of those series at that instant.
 
@@ -411,7 +411,7 @@ A `parent` that does not resolve to a real device or channel, a cycle in the tre
 Nothing about existing data changes when you turn this on: the raw Emporia series keep their names, their values, and their history. The feature only *adds* `Net Balance` series, so existing dashboards and queries keep working untouched.
 
 - **New installation.** Name your channels first (see [Channel Names](#channel-names)), then declare the tree. Balances are emitted from the first hourly rollover onward.
-- **Existing installation.** Add the `parent` entries and restart. Vuegraf computes balances only for points it collects from then on, so the new series begin at that moment and existing points get no balance retroactively. To fill them in for data you already have, re-run once with `--historydays`; re-written points overwrite the existing ones in InfluxDB rather than duplicating them.
+- **Existing installation.** Add the `parent` entries and restart. Vuegraf computes balances only for points it collects from then on, so the new series begin at that moment and existing points get no balance retroactively. To fill them in for data you already have, re-run once with `--historydays`; re-written points overwrite the existing ones in the database rather than duplicating them.
 - **Upgrading Vuegraf without configuring a tree.** The feature stays off, and collection behaves exactly as before. It activates only when an account declares a `parent` or sets `"hierarchyEnabled": true`.
 
 Two things to check before declaring a tree on an established installation:
@@ -548,7 +548,7 @@ options:
                         Starts executing by pulling history of Hours and Day data for specified number of days.
                         example: --load-history-day 60
   --resetdatabase       Drop database and create a new one
-  --skiprestore         During history backfill, skip restoring the cached CSV range into InfluxDB
+  --skiprestore         During history backfill, skip restoring the cached CSV range into the database
                         (assume it is already present) and only fetch/true-up the uncovered range
 ```
 
