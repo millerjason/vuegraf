@@ -12,8 +12,9 @@ from typing import Union
 from pyemvue.enums import Scale, Unit
 
 from vuegraf.config import getConfigValue
-from vuegraf.device import lookupDeviceName, lookupChannelName
+from vuegraf.device import lookupDeviceName, lookupChannelName, refreshHierarchy
 from vuegraf.destination import getLastDBTimeStamp, getTags
+from vuegraf.hierarchy import SOURCE_HISTORY, SOURCE_LIVE, NegativeBalanceError, computeNetBalances, nestingChanged
 from vuegraf.time import calculateHistoryTimeRange, convertToLocalDayInUTC
 
 
@@ -232,6 +233,58 @@ def extractDataPoints(config, account, device, stopTimeUTC, collectDetails, usag
                 index += 1
 
 
+def appendNetBalances(config, account, usageDataPoints: list[Point], startIndex, source, closedBefore=None):
+    """Appends the hierarchy's derived points for the batch at usageDataPoints[startIndex:].
+
+    Only hourly and daily readings are used: each such batch comes from requests covering
+    one closed period for every device, so its readings are aligned. A no-op for an
+    account that has not opted in.
+
+    A history batch that reaches the present ends with an hour and a day still in
+    progress, whose channels were each fetched at a slightly different moment. Given
+    closedBefore, a period that had not ended by then is left as raw readings only: nothing
+    is derived from it and it is never dropped. The live rollup derives it once it closes.
+
+    With hierarchyNegativeBalanceAbort set, each period whose tree does not add up is
+    dropped, raw readings included, so nothing is recorded for a period that could not be
+    balanced. The batch's other periods are kept, and NegativeBalanceError is then raised
+    naming the dropped ones.
+    """
+    hierarchy = account.get('hierarchy')
+    if hierarchy is None:
+        return
+    _, _, _, tagValue_hour, tagValue_day = getTags(config)
+    # Readings are watt-hours over the period, so the tolerance (in watts) scales with it.
+    epsilonHours = {tagValue_hour: 1, tagValue_day: 24}
+    # An hourly point is stamped with the start of its hour, a daily one with the last second of its day.
+    untilClosed = {tagValue_hour: datetime.timedelta(hours=1), tagValue_day: datetime.timedelta(seconds=1)}
+    epsilon = getConfigValue(config, 'hierarchyBalanceEpsilonWatts')
+    abort = getConfigValue(config, 'hierarchyNegativeBalanceAbort')
+    groups = {}
+    for point in usageDataPoints[startIndex:]:
+        if point.accountName == account['name'] and point.detailed in epsilonHours:
+            groups.setdefault((point.timestamp, point.detailed), {})[(point.deviceName, point.chanName)] = point.usageWatts
+    derivedPoints = []
+    dropped = {}
+    for (timestamp, detailed), readings in groups.items():
+        if closedBefore is not None and timestamp + untilClosed[detailed] > closedBefore:
+            continue
+        try:
+            derived = computeNetBalances(hierarchy, readings, source, epsilon * epsilonHours[detailed], abort)
+        except NegativeBalanceError as error:
+            dropped[(timestamp, detailed)] = error
+            continue
+        for (deviceName, chanName), watts in derived.items():
+            derivedPoints.append(Point(account['name'], deviceName, chanName, watts, timestamp, detailed))
+    if dropped:
+        usageDataPoints[startIndex:] = [point for point in usageDataPoints[startIndex:]
+                                        if point.accountName != account['name'] or (point.timestamp, point.detailed) not in dropped]
+    usageDataPoints.extend(derivedPoints)
+    if dropped:
+        raise NegativeBalanceError('; '.join('{} {}: {}'.format(detailed, timestamp.isoformat(), error)
+                                             for (timestamp, detailed), error in sorted(dropped.items())))
+
+
 def collectUsage(config, account, startTimeUTC, stopTimeUTC, collectDetails, usageDataPoints: list[Point], detailedStartTimeUTC, scale):
     """Module entrypoint. Fetch Vue data and unpack it into points.
 
@@ -247,12 +300,24 @@ def collectUsage(config, account, startTimeUTC, stopTimeUTC, collectDetails, usa
 
     logger.debug('Collecting data from Emporia; Scale={}; startTimeUTC={}; stopTimeUTC={}'.format(scale, startTimeUTC, stopTimeUTC))
 
+    # Every device is requested together. Beyond saving calls, this is what makes Emporia
+    # deduct a nested device from the channel it hangs under; see vuegraf.hierarchy.
     deviceGids = list(account['deviceIdMap'].keys())
+    startIndex = len(usageDataPoints)
     usages = account['vue'].get_device_list_usage(deviceGids, stopTimeUTC, scale=scale, unit=Unit.KWH.value)
     if usages is not None:
+        if pointType is not None and account.get('hierarchy') is not None and nestingChanged(account['hierarchy'], usages):
+            refreshHierarchy(config, account)
         for gid, device in usages.items():
             extractDataPoints(config, account, device, stopTimeUTC, collectDetails,
                               usageDataPoints, detailedStartTimeUTC, pointType, startTimeUTC)
+    if pointType is not None:
+        try:
+            appendNetBalances(config, account, usageDataPoints, startIndex, SOURCE_LIVE)
+        except NegativeBalanceError as error:
+            # The period was dropped. It is not retried: a closed period that does not
+            # balance will not start to, and retrying would hold back every later one.
+            logger.error('Not recording a period that does not balance: {}'.format(error))
 
 
 def collectHistoryUsage(config, account, startTimeUTC, stopTimeUTC, usageDataPoints: list[Point], pauseEvent):
@@ -272,9 +337,15 @@ def collectHistoryUsage(config, account, startTimeUTC, stopTimeUTC, usageDataPoi
         # Collect usage data for the historical period
         logger.debug('Collecting history data from Emporia; incrementStartTimeUTC={}; incrementEndTimeUTC={}'.format(
                      incrementStartTimeUTC, incrementEndTimeUTC))
+        batchStart = len(usageDataPoints)
         for gid, device in usages.items():
             extractDataPoints(config, account, device, stopTimeUTC, False, usageDataPoints, None,
                               'History', incrementStartTimeUTC, incrementEndTimeUTC)
+        try:
+            appendNetBalances(config, account, usageDataPoints, batchStart, SOURCE_HISTORY, closedBefore=stopTimeUTC)
+        except NegativeBalanceError as error:
+            # Only the periods that could not be balanced were dropped; keep backfilling.
+            logger.error('Not recording history periods that do not balance: {}'.format(error))
 
         historicBatchCounter = historicBatchCounter + 1
 

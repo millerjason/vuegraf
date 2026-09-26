@@ -119,6 +119,16 @@ def initConfig():
     setConfigDefault(config, 'timezone', None)
     setConfigDefault(config, 'maxHistoryDays', 720)
     setConfigDefault(config, 'updateIntervalSecs', 60)
+    # Used only by accounts with a device hierarchy; see vuegraf.hierarchy. A node reading
+    # short by more than the epsilon (average watts) is reported, or aborts the period.
+    setConfigDefault(config, 'hierarchyBalanceEpsilonWatts', 5.0)
+    setConfigDefault(config, 'hierarchyNegativeBalanceAbort', False)
+    epsilon = config['hierarchyBalanceEpsilonWatts']
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)) or epsilon < 0:
+        raise ValueError('hierarchyBalanceEpsilonWatts must be a number of watts, zero or more; got {!r}'.format(epsilon))
+    if not isinstance(config['hierarchyNegativeBalanceAbort'], bool):
+        raise ValueError('hierarchyNegativeBalanceAbort must be true or false; got {!r}'.format(
+                         config['hierarchyNegativeBalanceAbort']))
 
     # Create a sanitized copy for logging and remove sensitive information from it
     sanitized_config = config.copy()

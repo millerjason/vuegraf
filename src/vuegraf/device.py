@@ -74,3 +74,30 @@ def initDeviceAccount(config, account):
         account['vue'].login(username=account['email'], password=account['password'])
         logger.info('Emporia Login completed sucessfully')
         populateDevices(account)
+
+        account['hierarchy'] = buildAccountHierarchy(config, account)
+        if account['hierarchy'] is not None and not (config.get('detailedDataHoursEnabled', True) or
+                                                     config.get('detailedDataDaysEnabled', True)):
+            logger.warning('Account "{}" has a device hierarchy, but detailedDataHoursEnabled and detailedDataDaysEnabled '
+                           'are both off, so Net Balances will only be written by --historydays'.format(account.get('name')))
+
+
+def buildAccountHierarchy(config, account):
+    # Imported here because the hierarchy names its nodes with the lookups above.
+    from vuegraf.hierarchy import buildHierarchy
+    return buildHierarchy(account, seriesIncludeDevice=bool(config.get('addStationField', False)))
+
+
+def refreshHierarchy(config, account):
+    """Re-reads the devices and rebuilds the tree, after a live response showed a device or
+    nesting the tree does not have. On any failure the previous devices and tree are kept
+    and the error is logged; the next hourly or daily rollup tries again."""
+    previous = {key: account.get(key) for key in ('deviceIdMap', 'channelIdMap')}
+    try:
+        populateDevices(account)
+        account['hierarchy'] = buildAccountHierarchy(config, account)
+        logger.info('Device nesting changed in account "{}"; the hierarchy was rebuilt'.format(account.get('name')))
+    except Exception as error:
+        account.update(previous)
+        logger.error('Device nesting changed in account "{}", but the hierarchy could not be rebuilt, so Net Balances '
+                     'still follow the previous nesting: {}'.format(account.get('name'), error))

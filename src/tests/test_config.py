@@ -264,3 +264,20 @@ def test_init_config_custom_verbose(mock_config_logger, mock_init_logging, mock_
     log_message = mock_config_logger.info.call_args[0][0]
     assert "'timezone': 'UTC'" in log_message
     assert "'detailedDataEnabled': True" in log_message
+
+
+@pytest.mark.parametrize('settings, message', [
+    ({'hierarchyBalanceEpsilonWatts': '5'}, 'hierarchyBalanceEpsilonWatts must be a number of watts'),
+    ({'hierarchyBalanceEpsilonWatts': True}, 'hierarchyBalanceEpsilonWatts must be a number of watts'),
+    ({'hierarchyBalanceEpsilonWatts': -1}, 'hierarchyBalanceEpsilonWatts must be a number of watts'),
+    ({'hierarchyNegativeBalanceAbort': 'yes'}, 'hierarchyNegativeBalanceAbort must be true or false'),
+])
+def test_init_config_refuses_mistyped_hierarchy_settings(settings, message):
+    """A mistyped value would otherwise only fail inside the hourly rollup, every cycle."""
+    args = argparse.Namespace(configFilename='test.json', verbose=False, debug=False, historydays=0, resetdatabase=False,
+                              dryrun=False)
+    loaded = dict({'influxDb': {'host': 'localhost'}, 'accounts': []}, **settings)
+    with patch('vuegraf.config.initArgs', return_value=args), patch('builtins.open', mock_open(read_data='{}')), \
+            patch('json.load', return_value=loaded), patch('vuegraf.config.initLogging'):
+        with pytest.raises(ValueError, match=message):
+            config.initConfig()
